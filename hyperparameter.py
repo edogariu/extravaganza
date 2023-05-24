@@ -1,17 +1,15 @@
-# WHERE THE `Hyperparameter` class is defined
-
-from typing import Callable, Any
 import numpy as np
 from collections import deque
 
-from utils import FloatWrapper
+from wrappers import FloatWrapper
 
 """
 PIPELINE SHOULD BE:
-    1. make object with something like `lr = Hyperparameter(h=3, update_fn=lambda v: update_SGD_lr(v), o_0=0.54)`
+    1. make object with something like `lr = FloatHyperparameter(h=3, initial_value=0.54)`
+    2. use it as a float in ways like `opt = optim.Adam(lr)`
     2. every so often, call `lr.step(o=current val error, p=optional prediction)`
     
-    ((if prediction is None we use the last o))
+    ((if prediction is None we use the last `o` as our prediction))
 """
 
 class FloatHyperparameter(FloatWrapper):
@@ -31,16 +29,19 @@ class FloatHyperparameter(FloatWrapper):
         super().__init__(initial_value)
         
         # dynamic parameters of the optimization
-        self.M = np.zeros(self.h)
-        self.ns = deque([0.], maxlen=self.h)
-        self.epsilons = deque([0.], maxlen=self.h)
-        self.prev_o = 0.
+        self.M = np.zeros(self.h)  # self.M[i - 1] = M_i^t
+        self.ns = deque(maxlen=self.h)  # self.ns[i] = n_{t-i}
+        self.disturbances = deque(maxlen=2 * self.h)  # self.disturbances[-i] = epsilon_{t-i}
+        self.prev_o = None  # o_{t-1}, which we set p_t to if predictions aren't provided
         self.scale = 0.
         self.t = 0
+        
+        self.initial = initial_value
     
     def step(self, o: float, prediction: float=None):
         """
-        steps the hyperparameter once
+        steps the hyperparameter once.
+        FIRST STEP DOES NOTHING EXCEPT CACHE PREV OBSERVATION
 
         Parameters
         ----------
@@ -49,27 +50,42 @@ class FloatHyperparameter(FloatWrapper):
         prediction : float, optional
             p_t, if left as `None` will result in p_t=o_{t-1}
         """
-        assert self.M is not None, 'must call initialize() first'
+        
+        if self.prev_o is None:  # do nothing first time, so that next time we get accurate scale initialization
+            self.prev_o = o
+            self.scale = max(self.scale, abs(o))
+            return
         
         # observe
         epsilon = o - self.prev_o if prediction is None else o - prediction  # observe new objective and prediction
-        self.scale = max(self.scale, o)  # set scale
+        self.scale = max(self.scale, abs(o)) # set scale
         
         # REINFORCE update
-        # val = sum([n * epsilon for n, epsilon in zip(self.ns, self.epsilons)])  # TODO check if this should use epsilon_{t-1} or epsilon_{t-i}
-        val = sum([n * self.epsilons[-1] for n in self.ns])
-        self.M -= self.scale * o * val / np.sqrt(self.t + 1)  # TODO use better scalings
-        
+        for j in range(self.h):
+            grad_j = 0.
+            for i in range(1, self.h + 1):
+                if i + j > len(self.disturbances):
+                    break
+                grad_j += self.ns[-i] * self.disturbances[-(i + j)]
+            grad_j *= o / self.scale
+            
+            self.M[j] = self.M[j] - grad_j / np.sqrt(self.t + 1)
+
         # play eta_{t + 1}
         self.t += 1
-        self.epsilons.append(epsilon)
-        n = np.random.randn() * np.sqrt(self.scale)  # n_t
-        self.ns.append(n)
-        eta = n
-        for m, epsilon in zip(self.M, self.epsilons):  # m is M_i^t and epsilon is \hat{epsilon}_{t-i}
-            eta += m * epsilon
-        print('Updated learning rate from {} to {}!'.format(self, eta))
+        self.disturbances.append(epsilon)
+        
+        n = np.random.randn() * np.sqrt(self.scale)  # n_{t+1}
+        eta = 0.
+        for i in range(1, self.h + 1):
+            if i > len(self.disturbances):
+                break
+            eta += self.M[i - 1] * self.disturbances[-i]
+        eta += n
+            
+        print('Updated from {} to {}!'.format(self, eta))
         self.set_value(eta)        
+        self.ns.append(n)
         pass
         
 if __name__ == '__main__':
@@ -79,97 +95,3 @@ if __name__ == '__main__':
     print(lr, lr + 5, 8 - 2 * lr)
     lr.step(0.00001)
     print(lr, lr + 5, 8 - 2 * lr)
-
-
-
-# # WHERE THE `Hyperparameter` class is defined
-
-# from typing import Callable, Any
-# import numpy as np
-# from collections import deque
-
-# from utils import FloatWrapper
-
-# """
-# PIPELINE SHOULD BE:
-#     1. make object with something like `lr = Hyperparameter(h=3, update_fn=lambda v: update_SGD_lr(v), o_0=0.54)`
-#     2. every so often, call `lr.step(o=current val error, p=optional prediction)`
-    
-#     ((if prediction is None we use the last o))
-# """
-
-# class FloatHyperparameter(FloatWrapper):
-#     def __init__(self, h: int, o_0: float, p_0 : float=None):
-#         """
-#         GPC for a float hyperparameter. 
-#         Initializes hyperparameter values based on initial observation `(o_0, p_0)`
-
-#         Parameters
-#         ----------
-#         o : float
-#             o_0
-#         prediction : float, optional
-#             p_0, if left `None` will be used as p_0=0
-#         """
-#         self.value = FloatWrapper(0.)
-        
-#         self.h = h
-        
-#         # dynamic parameters of the optimization
-#         epsilon = o_0 if p_0 is None else o_0 - p_0
-#         self.M = np.zeros(self.h)
-#         self.ns = deque([0.], maxlen=self.h)
-#         self.epsilons = deque(maxlen=self.h)
-#         self.prev_o = o_0
-#         self.scale = o_0
-        
-#         # play eta_1
-#         self.t = 1
-#         self.epsilons.append(epsilon)
-#         eta = self._compute_eta()
-#         super().__init__(eta)
-#         pass
-    
-#     def step(self, o: float, prediction: float=None):
-#         """
-#         steps the hyperparameter once
-
-#         Parameters
-#         ----------
-#         o : float
-#             o_t
-#         prediction : float, optional
-#             p_t, if left as `None` will result in p_t=o_{t-1}
-#         """
-#         assert self.M is not None, 'must call initialize() first'
-        
-#         # observe
-#         epsilon = o - self.prev_o if prediction is None else o - prediction  # observe new objective and prediction
-#         self.scale = max(self.scale, o)  # set scale
-        
-#         # REINFORCE update
-#         # val = sum([n * epsilon for n, epsilon in zip(self.ns, self.epsilons)])  # TODO check if this should use epsilon_{t-1} or epsilon_{t-i}
-#         val = sum([n * self.epsilons[-1] for n in self.ns])
-#         self.M -= self.scale * o * val / np.sqrt(self.t + 1)  # TODO use better scalings
-        
-#         # play eta_{t + 1}
-#         self.t += 1
-#         self.epsilons.append(epsilon)
-#         self.set_value(self._compute_eta())
-#         pass
-        
-#     def _compute_eta(self):
-#         n = np.random.randn() * np.sqrt(self.scale)  # n_t
-#         self.ns.append(n)
-#         eta = n
-#         for m, epsilon in zip(self.M, self.epsilons):  # m is M_i^t and epsilon is \hat{epsilon}_{t-i}
-#             eta += m * epsilon
-#         return eta
-        
-# if __name__ == '__main__':
-#     np.random.seed(0)
-#     lr = FloatHyperparameter(5, None, 200)
-    
-#     print(lr, lr + 5, 8 - 2 * lr)
-#     lr.step(0.00001)
-#     print(lr, lr + 5, 8 - 2 * lr)
