@@ -28,7 +28,7 @@ class FloatWrapper:
         """
         if isinstance(value, jax.Array):
             self.value = value.clone()
-        elif isinstance(value, float):
+        elif isinstance(value, (int, float)):
             self.value = jnp.array([value])
         else:
             raise ValueError(value)
@@ -47,23 +47,23 @@ class FloatWrapper:
     # -----------------------------------------------------------------------------------------------
 
     # comparison interface
-    def __eq__(self, _value: float) -> bool:
-        return _v(self) == _v(_value)
+    def __eq__(self, __value: float) -> bool:
+        return _v(self) == _v(__value)
 
-    def __ne__(self, _value: float) -> bool:
-        return _v(self) != _v(_value)
+    def __ne__(self, __value: float) -> bool:
+        return _v(self) != _v(__value)
     
-    def __gt__(self, _value: float) -> bool:
-        return _v(self) > _v(_value)
+    def __gt__(self, __value: float) -> bool:
+        return _v(self) > _v(__value)
     
-    def __ge__(self, _value: float) -> bool:
-        return _v(self) >= _v(_value)
+    def __ge__(self, __value: float) -> bool:
+        return _v(self) >= _v(__value)
     
-    def __lt__(self, _value: float) -> bool:
-        return _v(self) < _v(_value)
+    def __lt__(self, __value: float) -> bool:
+        return _v(self) < _v(__value)
 
-    def __le__(self, _value: float) -> bool:
-        return _v(self) <= _v(_value)
+    def __le__(self, __value: float) -> bool:
+        return _v(self) <= _v(__value)
     
     def __bool__(self) -> bool:
         return _v(self) != 0
@@ -76,7 +76,7 @@ class FloatWrapper:
         return _v(self) * _v(__value)
     
     def __sub__(self, __value: float) -> float:
-        return (_v(self) - _v(__value))
+        return _v(self) - _v(__value)
     
     def __radd__(self, __value: float) -> float:
         return self.__add__(__value)
@@ -85,16 +85,22 @@ class FloatWrapper:
         return self.__mul__(__value)
     
     def __rsub__(self, __value: float) -> float:
-        return (_v(__value) - _v(self))
+        return _v(__value) - _v(self)
+    
+    def __truediv__(self, __value: float) -> float:
+        return _v(self) / _v(__value)
+    
+    def __rtruediv__(self, __value: float) -> float:
+        return _v(__value) / _v(self)
     
     def __neg__(self) -> float:
         return -_v(self)
     
     def __abs__(self) -> float:
-        return (abs(_v(self)))
+        return abs(_v(self))
     
     def __floor__(self) -> int:
-        return (_v(self).__floor__())
+        return _v(self).__floor__()
     
     # In-place operations alter the shared location
     def __iadd__(self, other):
@@ -113,6 +119,12 @@ class FloatWrapper:
 
     def __repr__(self):
         return repr(self.value.item())
+    
+    def log(self):
+        return jnp.log(_v(self))
+
+    def tanh(self):
+        return jnp.tanh(_v(self))
     
     
 if __name__ == '__main__':
