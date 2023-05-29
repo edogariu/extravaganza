@@ -102,14 +102,14 @@ class FloatWrapper:
     def __floor__(self) -> int:
         return _v(self).__floor__()
     
-    # In-place operations alter the shared location
-    def __iadd__(self, other):
-        self.value += _v(other)
-        return self
+    # # In-place operations alter the shared location
+    # def __iadd__(self, other):
+    #     self.value += _v(other)
+    #     return self
 
-    def __imul__(self, other):
-        self.value *= _v(other)
-        return self
+    # def __imul__(self, other):
+    #     self.value *= _v(other)
+    #     return self
 
     # Define the copy interface
     def __copy__(self):
@@ -118,7 +118,7 @@ class FloatWrapper:
         return new
 
     def __repr__(self):
-        return repr(self.value.item())
+        return repr(_v(self))
     
     def log(self):
         return jnp.log(_v(self))

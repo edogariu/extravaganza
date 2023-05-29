@@ -1,250 +1,175 @@
-import numpy as np
 from collections import deque
+import numpy as np
 
 from wrappers import FloatWrapper
 
-# TESTING THINGS
+NONNEGATIVE = False
 
 class FloatHyperparameter(FloatWrapper):
-    def __init__(self, h: int, initial_value: float, initial_scale: float, clip_size: float):
+    def __init__(self, 
+                 h: int, 
+                 initial_value: float, 
+                 initial_scale: float, 
+                 w_clip_size: float=float('inf'), 
+                 M_clip_size: float=float('inf'), 
+                 B_clip_size: float=float('inf'),
+                 cost_clip_size: float=float('inf'), 
+                 quadratic_term: float=0,
+                 nonnegative: bool=False,
+                 method='FKM'):
         """
         GPC for a float hyperparameter. 
-        Initializes hyperparameter values based on initial observation `(o_0, p_0)`
 
         Parameters
         ----------
         h : float
             window size
-        initial_value : float, optional
+        initial_value : float
             initial value for the hyperparameter to take
+        initial_scale : float
+        w_clip_size : float
+        M_clip_size : float
+        B_clip_size : float
+        cost_clip_size : float
+        quadratic_term : float
+        nonnegative : bool
+        grad_estimation_method : str
         """
+        
+        assert method in ['FKM', 'REINFORCE']
+        
         self.h = h
         self.initial_scale = initial_scale
-        self.clip_size = clip_size
-        super().__init__(initial_value)
+        self.w_clip_size = w_clip_size
+        self.M_clip_size = M_clip_size
+        self.B_clip_size = B_clip_size
+        self.cost_clip_size = cost_clip_size
+        self.quadratic_term = quadratic_term
+        self.nonnegative = nonnegative
+        self.method = method
+        super().__init__(initial_value if not self.nonnegative else np.sqrt(initial_value))
+        self.initial = initial_value
         
         # dynamic parameters of the optimization
-        self.M = np.zeros(self.h)  # self.M[i - 1] = M_i^t
-        self.ns = np.zeros(self.h)  # self.ns[i - 1] = n_{t, i}
-        self.disturbances = deque(maxlen=self.h)  # self.disturbances[i] = epsilon_{t-i}
-        self.prev_o = None  # o_{t-1}, which we set p_t to if predictions aren't provided
-        self.t = 0
-        
-        self.initial = initial_value
+        if method == 'REINFORCE':
+            self.M = np.zeros(self.h + 1)  # self.M[i] = M_i^t, but self.M[-1] is the bias
+            self.ns = deque(maxlen=self.h)  # self.ns[i] = n_{t-i}
+            self.ws = deque(maxlen=2 * self.h)  # self.ws[i] = epsilon_{t-i}
+            self.prev = None
+            self.t = 0
+        elif method == 'FKM':
+            self.M = np.zeros(self.h + 1)  # self.M[i] = M_i^t, but self.M[-1] is the bias
+            self.ns = np.zeros(self.h + 1)  # self.ns[i] = n_{t, i}, but self.ns[-1] = n_{t, 0} is the bias noise
+            self.ws = deque(maxlen=self.h)  # self.ws[i] = epsilon_{t-i}
+            self.prev = None  # p_{t-1}
+            self.t = 0
+        else:
+            raise NotImplementedError()
     
-    def step(self, o: float, grad_eta: float, prediction: float=None):
+    def get_value(self) -> float:  # square u_t if we desire nonnegative controls
+        return super().get_value() ** 2 if self.nonnegative else super().get_value()
+    
+    def step(self, obj: float, B: float, grad_u: float=None):
         """
         steps the hyperparameter once.
         FIRST STEP DOES NOTHING EXCEPT CACHE PREV OBSERVATION
 
         Parameters
         ----------
-        o : float
+        obj : float
             o_t
-        prediction : float, optional
-            p_t, if left as `None` will result in p_t=o_{t-1}
+        B : float
+            `B` param of the LDS
+        grad_u : float
+            gradient of cost w.r.t. control variable `u_t`
         """
+        # clip what we gotta
+        obj = np.clip(obj, -self.cost_clip_size, self.cost_clip_size)
+        B = np.clip(B, -self.B_clip_size, self.B_clip_size)
+        if grad_u is not None: grad_u = np.clip(grad_u, -self.B_clip_size, self.B_clip_size)
         
-        if self.prev_o is None:  # do nothing first time, so that next time we get accurate scale initialization
-            self.prev_o = o
+        if self.prev is None:  # cache observation on first step
+            self.prev = obj
             return
         
         # observe
-        prediction = self.prev_o + sum([m * eps for m, eps in zip(self.M, self.disturbances)])
-        epsilon = o - prediction
-        self.prev_o = prediction
-        epsilon = np.clip(epsilon, -self.clip_size, self.clip_size)
+        pred = self.prev + self.get_value() * B  # f(x_t) + u_t * B
+        w = obj - pred - self.quadratic_term * self.get_value() ** 2
+        self.prev = obj
         
-        # FKM update
+        w = np.clip(w, -self.w_clip_size, self.w_clip_size)
+        
+        # set scale
+        scale = self.initial_scale / (self.t + 1) ** 0.25
+        meta_lr = 1 / (self.h * np.sqrt(self.t + 1))
+        
+        # update
         for j in range(self.h):
-            if j >= len(self.disturbances): break
-            grad_j = grad_eta * self.disturbances[j]
-            self.M[j] -= grad_j / (self.h * np.sqrt(self.t + 1))
-
+            if grad_u is not None:   # use provided gradients
+                if j >= len(self.ws): break
+                grad_j = grad_u * self.ws[j]
+                if self.nonnegative: grad_j *= 2 * super().get_value()
+            else:  # estimate the gradients!!!
+                if self.method == 'FKM':
+                    if j >= len(self.ns): break
+                    grad_j = self.ns[j] * w / scale
+                elif self.method == 'REINFORCE':
+                    grad_j = sum([self.ns[i] * self.ws[i + j] for i in range(self.h) if i + j < len(self.ws)]) * w / scale
+            self.M[j] -= meta_lr * grad_j 
+        
+        if grad_u is not None:  # update bias
+            grad_bias = grad_u
+            if self.nonnegative: grad_bias *= 2 * super().get_value()
+        else:
+            if self.method == 'FKM':
+                grad_bias = self.ns[-1] * w / scale
+            elif self.method == 'REINFORCE':
+                # grad_bias = w / scale
+                raise NotImplementedError()
+        self.M[-1] -= meta_lr * grad_bias
+            
+        self.M = np.clip(self.M, -self.M_clip_size, self.M_clip_size)
+        
         # play eta_{t + 1}
         self.t += 1
-        self.disturbances.appendleft(epsilon)
-        self.ns = np.random.randn(self.h) * np.sqrt(self.initial_scale / self.t ** 0.25)
+        self.ws.appendleft(w)
+
+        u = self._compute_u(scale)
         
-        eta = self.initial
-        for M, n, epsilon in zip(self.M, self.ns, self.disturbances):
-            eta += (M + n) * epsilon
-        # eta = abs(eta)
+        # if NONNEGATIVE:
+        #     n_tries = 0
+        #     while True:
+        #         n_tries += 1   
+        #         u = self._compute_u(scale)
+        #         if u <= 0 and self.method == 'REINFORCE':
+        #             self.ns.popleft()
+        #         if u > 0:
+        #             break
+        #     if n_tries > 10: print(n_tries, 'tries')
+        # else:
+        #     u = self._compute_u(scale)
             
-        print('Updated from {} to {}!'.format(self, eta))
-        self.set_value(eta)        
+        # print('Updated from {} to {} using {} with disturbances {}!'.format(self, u, self.M, list(self.ws)[:self.h]))
+        old = self.get_value()
+        self.set_value(u)        
+        print('Updated from {} to {}!'.format(old, self.get_value()))
         pass
 
-# # FKM METHOD
-# """
-# PIPELINE SHOULD BE:
-#     1. make object with something like `lr = FloatHyperparameter(h=3, initial_value=0.54)`
-#     2. use it as a float in ways like `opt = optim.Adam(lr)`
-#     2. every so often, call `lr.step(o=current val error, p=optional prediction)`
-    
-#     ((if prediction is None we use the last `o` as our prediction))
-# """
-
-# class FloatHyperparameter(FloatWrapper):
-#     def __init__(self, h: int, initial_value: float):
-#         """
-#         GPC for a float hyperparameter. 
-#         Initializes hyperparameter values based on initial observation `(o_0, p_0)`
-
-#         Parameters
-#         ----------
-#         h : float
-#             window size
-#         initial_value : float, optional
-#             initial value for the hyperparameter to take
-#         """
-#         self.h = h
-#         super().__init__(initial_value)
-        
-#         # dynamic parameters of the optimization
-#         self.M = np.zeros(self.h)  # self.M[i - 1] = M_i^t
-#         self.ns = np.zeros(self.h)  # self.ns[i - 1] = n_{t, i}
-#         self.disturbances = deque(maxlen=self.h)  # self.disturbances[-i] = epsilon_{t-i}
-#         self.prev_o = None  # o_{t-1}, which we set p_t to if predictions aren't provided
-#         self.scale = 1e-8
-#         self.t = 0
-        
-#         self.initial = initial_value
-    
-#     def step(self, o: float, prediction: float=None):
-#         """
-#         steps the hyperparameter once.
-#         FIRST STEP DOES NOTHING EXCEPT CACHE PREV OBSERVATION
-
-#         Parameters
-#         ----------
-#         o : float
-#             o_t
-#         prediction : float, optional
-#             p_t, if left as `None` will result in p_t=o_{t-1}
-#         """
-        
-#         if self.prev_o is None:  # do nothing first time, so that next time we get accurate scale initialization
-#             self.prev_o = o
-#             return
-        
-#         # observe
-#         epsilon = o - self.prev_o if prediction is None else o - prediction  # observe new objective and prediction
-#         self.scale = max(self.scale, abs(epsilon)) # set scale
-        
-#         # FKM update
-#         for j in range(self.h):
-#             grad_j = self.ns[j] * o / self.scale
-#             self.M[j] -= grad_j / np.sqrt(self.t + 1)
-
-#         self.M = np.clip(self.M, -0.1, 0.1)
-#         epsilon = np.clip(epsilon, -1, 1)
-
-#         # play eta_{t + 1}
-#         self.t += 1
-#         self.disturbances.appendleft(epsilon)
-#         self.ns = np.random.randn(self.h) * np.sqrt(self.scale)
-        
-#         eta = 0.
-#         for M, n, epsilon in zip(self.M, self.ns, self.disturbances):
-#             eta += (M + n) * epsilon
+    def _compute_u(self, scale: float):
+        u = self.M[-1] # self.initial
+        if self.method == 'FKM':
+            self.ns = np.random.randn(self.h + 1) * np.sqrt(scale)
+            for j in range(min(self.h, len(self.ws))):
+                M, n, w = self.M[j], self.ns[j], self.ws[j]
+                u += (M + n) * w
+            u += self.ns[-1]  # add bias noise
             
-#         print('Updated from {} to {}!'.format(self, eta))
-#         self.set_value(eta)        
-#         pass
-        
-
-# REINFORCE METHOD
-# """
-# PIPELINE SHOULD BE:
-#     1. make object with something like `lr = FloatHyperparameter(h=3, initial_value=0.54)`
-#     2. use it as a float in ways like `opt = optim.Adam(lr)`
-#     2. every so often, call `lr.step(o=current val error, p=optional prediction)`
+        elif self.method == 'REINFORCE':
+            n = np.random.randn() * np.sqrt(scale)
+            for j in range(min(self.h, len(self.ws))):
+                M, w = self.M[j], self.ws[j]
+                u += M * w
+            u += n  # add bias noise
+            self.ns.appendleft(n)
+        return u
     
-#     ((if prediction is None we use the last `o` as our prediction))
-# """
-
-# class FloatHyperparameter(FloatWrapper):
-#     def __init__(self, h: int, initial_value: float):
-#         """
-#         GPC for a float hyperparameter. 
-#         Initializes hyperparameter values based on initial observation `(o_0, p_0)`
-
-#         Parameters
-#         ----------
-#         h : float
-#             window size
-#         initial_value : float, optional
-#             initial value for the hyperparameter to take
-#         """
-#         self.h = h
-#         super().__init__(initial_value)
-        
-#         # dynamic parameters of the optimization
-#         self.M = np.zeros(self.h)  # self.M[i - 1] = M_i^t
-#         self.ns = deque(maxlen=self.h)  # self.ns[i] = n_{t-i}
-#         self.disturbances = deque(maxlen=2 * self.h)  # self.disturbances[-i] = epsilon_{t-i}
-#         self.prev_o = None  # o_{t-1}, which we set p_t to if predictions aren't provided
-#         self.scale = 0.
-#         self.t = 0
-        
-#         self.initial = initial_value
-    
-#     def step(self, o: float, prediction: float=None):
-#         """
-#         steps the hyperparameter once.
-#         FIRST STEP DOES NOTHING EXCEPT CACHE PREV OBSERVATION
-
-#         Parameters
-#         ----------
-#         o : float
-#             o_t
-#         prediction : float, optional
-#             p_t, if left as `None` will result in p_t=o_{t-1}
-#         """
-        
-#         if self.prev_o is None:  # do nothing first time, so that next time we get accurate scale initialization
-#             self.prev_o = o
-#             self.scale = max(self.scale, abs(o))
-#             return
-        
-#         # observe
-#         epsilon = o - self.prev_o if prediction is None else o - prediction  # observe new objective and prediction
-#         self.scale = max(self.scale, abs(o)) # set scale
-        
-#         # REINFORCE update
-#         for j in range(self.h):
-#             grad_j = 0.
-#             for i in range(1, self.h + 1):
-#                 if i + j > len(self.disturbances):
-#                     break
-#                 # grad_j += self.ns[-i] * self.disturbances[-(i + j)]
-                
-#             grad_j *= o / self.scale
-            
-#             self.M[j] = self.M[j] - grad_j / np.sqrt(self.t + 1)
-
-#         # play eta_{t + 1}
-#         self.t += 1
-#         self.disturbances.append(epsilon)
-        
-#         n = np.random.randn() * np.sqrt(self.scale)  # n_{t+1}
-#         eta = 0.
-#         for i in range(1, self.h + 1):
-#             if i > len(self.disturbances):
-#                 break
-#             eta += self.M[i - 1] * self.disturbances[-i]
-#         eta += n
-            
-#         print('Updated from {} to {}!'.format(self, eta))
-#         self.set_value(eta)        
-#         self.ns.append(n)
-#         pass
-        
-# if __name__ == '__main__':
-#     np.random.seed(0)
-#     lr = FloatHyperparameter(5, 0.1)
-    
-#     print(lr, lr + 5, 8 - 2 * lr)
-#     lr.step(0.00001)
-#     print(lr, lr + 5, 8 - 2 * lr)
