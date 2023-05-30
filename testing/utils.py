@@ -1,14 +1,16 @@
+import numpy as np
 import torch
 import torch.nn as nn
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def window_average(seq, window_size: int):
+def window_average(seq, window_size: int, use_median: bool=False):
+    ret = []
     for i in range(len(seq)):
         l = max(0, i - window_size // 2)
         r = min(i + window_size // 2, len(seq) - 1)
-        seq[i] = sum(seq[l: r]) / (r - l)
-    return seq
+        ret.append(np.mean(seq[l: r]) if not use_median else np.median(seq[l: r]))
+    return np.array(ret)
 
 def count_parameters(model: nn.Module):
     return sum(p.numel() for p in model.parameters())

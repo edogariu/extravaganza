@@ -36,6 +36,9 @@ class FloatWrapper:
     def get_value(self) -> float:
         return float(self.value.item())
     
+    def item(self) -> float:
+        return self.get_value()
+    
     def set_value(self, value: float):
         if isinstance(value, jax.Array):
             self.value = value.clone()
@@ -120,12 +123,15 @@ class FloatWrapper:
     def __repr__(self):
         return repr(_v(self))
     
+    # other things
     def log(self):
         return jnp.log(_v(self))
 
     def tanh(self):
         return jnp.tanh(_v(self))
     
+    def __round__(self, __ndigits):
+        return round(_v(self), __ndigits)
     
 if __name__ == '__main__':
     import math

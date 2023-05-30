@@ -1,96 +1,196 @@
-from collections import defaultdict
+import warnings; warnings.filterwarnings('ignore')
+import matplotlib.pyplot as plt
+import tqdm
+
+# for multiprocessing -- NOTE you may need to `export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` for this to work
+from pathos.multiprocessing import _ProcessPool as Pool
+from multiprocessing import Value
+from os import cpu_count
+import time
+
+import numpy as np
+import torch
+import hypergrad
 
 from hyperparameter import FloatHyperparameter
-from testing.problems import TorchLinearRegression, TorchMNIST
-from testing.models import MLP
+from optimizer import SGD
+from testing.problems import PROBLEM_CLASSES, PROBLEM_ARGS
 from testing.utils import window_average
 
-if __name__ == '__main__':
-    num_iters = 2000
-    step_every = 2
-    reset_every = 200
+def main():
+    use_multiprocessing = True
+    
+    num_iters = 7000
+    num_trials = 8
+    step_every = 1
+    eval_every = 20
+    reset_every = 1000
+    window_size = 40
     seed = None
     
-    alg_args = {
+    problem = 'LR' # ['LR', 'MNIST MLP', 'MNIST CNN']
+
+    lr_args = {
         'h': 5,
-        'initial_value': 20,
-        'initial_scale': 0.01,
+        'initial_value': 1,
+        'initial_scale': 0.05,
+        'interval': (-1, 1),
         'nonnegative': True,
         'quadratic_term': 1,
-        'w_clip_size': 1.,
-        # 'M_clip_size': 1.,
-        'B_clip_size': 1,
-        'cost_clip_size': 1,
+        'w_clip_size': 0.5,
+        # 'M_clip_size': 0.5,
+        'B_clip_size': 0.5,
+        'cost_clip_size': 0.5,
         'method': 'FKM',
     }    
-    baseline_args = {
-        'SGD': {'lr': 0.1}
+    momentum_args = {
+        'h': 5,
+        'initial_value': 0.3,
+        'initial_scale': 0.2,
+        'interval': (-0.99, 0.99),
+        'nonnegative': True,
+        'quadratic_term': 1,
+        'w_clip_size': 0.5,
+        # 'M_clip_size': 1,
+        'B_clip_size': 0.5,
+        'cost_clip_size': 0.5,
+        'method': 'FKM',
+    }    
+    optimizers = {
+        # 'ours (lr)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), step_every=step_every),
+        # 'ours (lr) +m': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=0.9, step_every=step_every),
+        # 'ours (m)': lambda model: SGD(model.parameters(), lr=0.01, momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
+        'ours (lr, m)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
+        'SGD': lambda model: torch.optim.SGD(model.parameters(), lr=0.1),
+        'SGD +m': lambda model: torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9),
+        # 'SGDHD': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.1, hypergrad_lr=1e-7),
+        # 'SGDHD +m': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.01, hypergrad_lr=5e-8, momentum=0.9),
+        # 'ADAM': lambda model: torch.optim.Adam(model.parameters(), lr=0.1, weight_decay=1e-5),
     }
     
-    problem_class = TorchLinearRegression 
-    problem_args = {
-        'batch_size': 64,
-        'n_features': 100,
-        'n_informative': 30,
-        'n_samples': 1000,
-        'noise': 0.1,  # std dev of noise
-    }
-    
-    # problem_class = TorchMNIST
-    # problem_args = {
-    #     'batch_size': 64,
-    #     'make_model': lambda: MLP(layer_dims=[int(28 * 28), 100, 10]),
-    # }
-
-    # make problem with eta_0
-    lr = FloatHyperparameter(**alg_args)
-    opt_args = {'ours': {'lr': lr}}
-    opt_args.update(baseline_args)
-    problem = problem_class(opt_args=opt_args, seed=seed, **problem_args)
-    
-    vals = [lr.get_value()]
-    disturbances = []
-    errors = defaultdict(list)
-    
-    # repeat
-    for n_step in range(num_iters // step_every):
-        if (n_step * step_every) % reset_every == 0:
-            problem.reset()
-            
-        try:
-            # train until next step
-            ret = problem.train(step_every)
-            
-            # collect errors
-            for k, v in ret['errors'].items():
-                errors[k].append(v)
-                
-            # step
-            print('f(x_{}) = {}'.format(n_step, errors['ours'][-1]))
-            lr.step(obj=errors['ours'][-1], grad_u=ret['grad_lr'], B=-ret['grad_mag'])
-            # lr.step(obj=errors['ours'][-1], B=-ret['grad_mag'])
-
-            vals.append(lr.get_value())
-            if len(lr.ws) > 0: disturbances.append(lr.ws[0])
-        except KeyboardInterrupt:
-            print('Catching keyboard interrupt!')
-            break
+    results = {}
+    for opt_name, o in optimizers.items():
+        probe_fns = {}
+        if '(lr)' in opt_name: probe_fns['disturbances'] = lambda p: p.opt.param_groups[0]['lr'].ws[0].item() if len(p.opt.param_groups[0]['lr'].ws) > 0 else 0
+        if '(m)' in opt_name: probe_fns['disturbances'] = lambda p: p.opt.param_groups[0]['momentum'].ws[0].item() if len(p.opt.param_groups[0]['momentum'].ws) > 0 else 0
+        results[opt_name] = do_trials(problem, o, seed, probe_fns, 
+                                      num_trials, num_iters, eval_every, reset_every, use_multiprocessing)
         
-    import matplotlib.pyplot as plt
-    window_size = 30
-
-    fig, ax = plt.subplots(1, 3)
-    vals = window_average(vals, window_size)
-    ax[0].plot(range(len(vals)), vals, label='ours')
-    ax[0].set_title('learning rate')
-    
-    for k, v in errors.items(): ax[1].plot(range(len(v)), v, label=k)
-    ax[1].set_title('errors')
-    ax[1].set_ylim([0, 0.3])
-    ax[1].legend()
-    
-    disturbances = window_average(disturbances, window_size)
-    ax[2].plot(range(len(disturbances)), disturbances)
-    ax[2].set_title('disturbances')
-    plt.show()
+    plot_results(results, window_size, problem)
     exit(0)
+    
+    
+    
+def plot_results(results, window_size, problem):
+    fig, ax = plt.subplots(2, 2)
+    STD_MULT = 1.0
+    for opt_name, stats in results.items():
+        # plot learning rates
+        means = window_average(stats['lrs']['means'], window_size)
+        stds = window_average(stats['lrs']['stds'], window_size)
+        ax[0, 0].plot(stats['lrs']['ts'], means, label=opt_name)
+        ax[0, 0].fill_between(stats['lrs']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        # plot momentum
+        means = window_average(stats['momenta']['means'], window_size)
+        stds = window_average(stats['momenta']['stds'], window_size)
+        ax[0, 1].plot(stats['momenta']['ts'], means, label=opt_name)
+        ax[0, 1].fill_between(stats['momenta']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        # # plot disturbances
+        # if 'ours' in opt_name:
+        #     means = window_average(stats['disturbances']['means'], window_size)
+        #     stds = window_average(stats['disturbances']['stds'], window_size)
+        #     ax[0, 1].plot(stats['disturbances']['ts'], means, label=opt_name)
+        #     ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        # plot train losses
+        means = window_average(stats['train_losses']['means'], window_size)
+        stds = window_average(stats['train_losses']['stds'], window_size)
+        # means = stats['train_losses']['means']
+        # stds = stats['train_losses']['stds']
+        ax[1, 0].plot(stats['train_losses']['ts'], means, label=opt_name)
+        ax[1, 0].fill_between(stats['train_losses']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        # plot val errors
+        # means = window_average(stats['val_errors']['means'], window_size)
+        # stds = window_average(stats['val_errors']['stds'], window_size)
+        means = stats['val_errors']['means']
+        stds = stats['val_errors']['stds']
+        ax[1, 1].plot(stats['val_errors']['ts'], means, label=opt_name)
+        ax[1, 1].fill_between(stats['val_errors']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+    
+    ax[0, 0].set_title('{} learning rate'.format(problem))
+    ax[0, 0].legend()
+    ax[0, 0].set_ylim([0, 0.4])
+    
+    ax[0, 1].set_title('{} momentum'.format(problem))
+    ax[0, 1].legend()
+    ax[0, 1].set_ylim([0, 1.])
+    # ax[0, 1].set_title('{} disturbances'.format(problem))
+    # ax[0, 1].legend()
+    
+    ax[1, 0].set_title('{} train losses'.format(problem))
+    ax[1, 0].legend()
+    ax[1, 0].set_ylim([0, 1. if 'MNIST' in problem else 0.15])
+    
+    ax[1, 1].set_title('{} val errors'.format(problem))
+    ax[1, 1].legend()
+    ax[1, 1].set_ylim([0, 0.3 if 'MNIST' in problem else 0.03])
+    plt.show()
+    pass
+
+
+def init(args):
+    ''' store the counter for later use '''
+    global counter
+    counter = args
+    # sys.stdout = open(os.d evnull, 'w') 
+    # sys.stderr = open(os.devnull, 'w')
+
+def run_trial(problem, o, seed, probe_fns, num_iters, eval_every, reset_every, use_multiprocessing):
+    problem = PROBLEM_CLASSES[problem](o, seed=seed, probe_fns=probe_fns, **PROBLEM_ARGS[problem])
+    s = problem.train(num_iters, eval_every, reset_every, wordy=not use_multiprocessing)
+    if use_multiprocessing:
+        with counter.get_lock():
+            counter.value += 1
+    return s
+
+def do_trials(problem, o, seed, probe_fns, num_trials, num_iters, eval_every, reset_every, use_multiprocessing):        
+    if use_multiprocessing:        
+        # split da pie
+        counter = Value('i', 0)
+        n_cpu = cpu_count()        
+
+        with Pool(processes=n_cpu, initializer = init, initargs = (counter,)) as pool:
+            stats = pool.starmap_async(run_trial, [(problem, o, i, probe_fns, num_iters, eval_every, reset_every, use_multiprocessing) for i in range(num_trials)])
+            prev_count = counter.value - 1
+            with tqdm.tqdm(total=num_trials) as pbar:
+                while counter.value < num_trials:
+                    if counter.value != prev_count:
+                        pbar.update(counter.value - prev_count)
+                        prev_count = counter.value
+                    else:
+                        time.sleep(0.0001)
+            pool.close()
+            pool.join()
+            stats = stats.get()
+    else:
+        stats = [run_trial(problem, o, seed, probe_fns, num_iters, eval_every, reset_every, use_multiprocessing) for _ in range(num_trials)]
+            
+    ret = {}
+    for k in stats[0].keys():
+        r = {}
+        m = np.stack([np.array(list(s[k].values())) for s in stats])
+        r['ts'] = list(stats[0][k].keys())
+        r['means'] = np.mean(m, axis=0)
+        r['stds'] = np.std(m, axis=0)
+        # r['means'] = np.median(m, axis=0)
+        # r['stds'] = np.subtract(*np.percentile(m, [75, 25], axis=0))
+        ret[k] = r
+    
+    return ret
+
+
+if __name__ == '__main__':
+   main()

@@ -1,56 +1,68 @@
 from abc import abstractmethod
-from copy import deepcopy
-from collections import defaultdict
-from typing import Dict, Any, Tuple
+from typing import Dict, Tuple, Callable
+import tqdm
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from testing.utils import device, count_parameters
-
-METHODS = ['ours', 'SGD',]  # will add more when i add them to .reset()
+from testing.utils import device
 
 class BaseTorchProblem:
     """
     SUBCLASSES MUST IMPLEMENT 
-    - `get_model(self, seed: int=None) -> torch.nn.Module`
     - `get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]`
     - `loss_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor`
     - `error_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> float`
     """
     def __init__(self, 
-                opt_args: Dict[str, Dict],
-                seed: int=None
-                ):
+                 model: torch.nn.Module,
+                 optimizer: torch.optim.Optimizer,
+                 seed: int=None,
+                 probe_fns: Dict[str, Callable]={}
+                 ):
         """
         creates an optimization problem
-        """
-        for k in opt_args.keys():
-            assert k in METHODS, '{} is not a valid or implemented optimization method'.format(k)
-            
-        self.opt_args = opt_args
-        self.reset(seed=seed)
         
-    @abstractmethod
-    def get_model(self, seed: int=None) -> torch.nn.Module:
+        Parameters
+        ----------
+        model : torch.nn.Module
+            model to train
+        optimizer : torch.optim.Optimizer
+            optimizer to train `model.parameters()`
+        seed : int
+            random seed
+        probe_fns : Dict[str, Callable]
+            functions that takes as input the `BaseTorchProblem` object and return probed values
         """
-        returns a newly initialized version of the model we will use
-        """
-        model = ...
-        raise NotImplementedError()
+        self.model = model
+        self.opt = optimizer
+        self.reset(seed=seed)
+        self.probe_fns = probe_fns
+        
+        self.t = 0
+        self.stats = {'train_losses': {},
+                      'val_errors': {},
+                      'lrs': {},
+                      'momenta': {}}
+        self.last_loss = 0
+        for k in self.probe_fns.keys():
+            self.stats[k] = {}
+            
+        if hasattr(self.opt, 'add_closure_func'):
+            self.opt.add_closure_func(lambda: self.last_loss)
         
     @abstractmethod
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
         """
-        creates a new copy of the dataset for this problem. returns a train and test dataloader
+        creates a new copy of the dataset for this problem. returns a train and val dataloader
 
         Parameters
         ----------
         seed : int, optional
             seed, by default None
         """
-        train_dl = test_dl = ...
+        train_dl = val_dl = ...
         raise NotImplementedError()
     
     @abstractmethod
@@ -62,7 +74,6 @@ class BaseTorchProblem:
     def error_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> float:
         error = ...
         raise NotImplementedError()
-        
     
     def reset(self, seed=None):
         """
@@ -74,121 +85,86 @@ class BaseTorchProblem:
             np.random.seed(seed)
         
         # DATASET
-        self.train_dl, self.test_dl = self.get_dataset(seed)
+        self.train_dl, self.val_dl = self.get_dataset(seed)
+        self.dl = iter(self.train_dl)
         
-        # MODELS and OPTIMIZERS
-        model = self.get_model()
-        for layer in model.children():  # reinitialize the model
+        # MODEL REINIT
+        for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-        
-        self.models = {}
-        self.opts = {}
-        for k, args in self.opt_args.items():
-            m = deepcopy(model); m.load_state_dict(model.state_dict())
-            self.models[k] = m
-            
-            """
-            TODO HERE IS WHERE TO INITIALIZE NEW OPTIMIZERS
-            """
-            if k == 'ours':
-                self.opts[k] = torch.optim.SGD(m.parameters(), **args)
-            elif k == 'SGD':
-                self.opts[k] = torch.optim.SGD(m.parameters(), **args)
+        self.model.train()
         pass
-
-    def train_step(self, 
-                   x: torch.Tensor,
-                   y: torch.Tensor) -> float:
-        """
-        steps the optimization of the main copy and the baselines once.
-        returns the vector of gradient of loss function w.r.t the parameters of the model
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            inputs
-        y : torch.Tensor
-            outputs
-        """
-        for m in self.models.values():
-            m.train()
+    
+    def train_step(self):
+        if not self.model.training: self.model.train()
+        try: 
+            x, y = next(self.dl)
+        except StopIteration: 
+            self.dl = iter(self.train_dl)
+            x, y = next(self.dl)
         
-        # GD updates
-        for model, opt in zip(self.models.values(), self.opts.values()):
-            opt.zero_grad()
-            loss = self.loss_fn(model(x), y)
-            loss.backward()
-            opt.step()
-    
-        # assemble gradient vector for our method
-        if 'ours' in self.models:
-            i = 0
-            grad = np.zeros(count_parameters(self.models['ours']))
-            for p in self.models['ours'].parameters():
-                l = p.numel()
-                grad[i: i + l] = p.grad.reshape(-1).detach().cpu().data.numpy()
-                i += l
-            return grad
-        else:
-            return None
-    
-    def compute_error(self, dataloader: DataLoader) -> float:
-        """
-        computes the mean error over an entire dataset.
-
-        Parameters
-        ----------
-        dataloader : DataLoader
-            the dataset
-        """
-        for m in self.models.values():
-            m.eval()
+        x = x.to(device); y = y.to(device)
+        self.opt.zero_grad()
+        loss = self.loss_fn(self.model(x), y)
+        loss.backward()
+        self.opt.step()
+        
+        # probe and cache desired quantities
+        loss = loss.item()
+        self.stats['train_losses'][self.t] = loss
+        lr = self.opt.param_groups[0]['lr']
+        self.stats['lrs'][self.t] = lr if not hasattr(lr, 'item') else lr.item()
+        try:
+            momentum = self.opt.param_groups[0]['momentum']
+            self.stats['momenta'][self.t] = momentum if not hasattr(momentum, 'item') else momentum.item()
+        except KeyError:
+            pass
+        for k, f in self.probe_fns.items():
+            self.stats[k][self.t] = f(self)
             
-        errors = defaultdict(list)
-        with torch.no_grad():
-            for x, y in dataloader:
-                x = x.to(device); y = y.to(device)
-                
-                for k, m in self.models.items():
-                    errors[k].append(self.error_fn(m(x), y))
-                    
-        errors = {k: np.mean(err) for k, err in errors.items()}  # take means
-        return errors
+        self.t += 1
+        self.last_loss = loss
+        return loss
     
-    def train(self, num_iters: int) -> Dict[str, Any]:
+    def eval(self):
+        self.model.eval()
+        errs = []
+        with torch.no_grad():
+            for x, y in self.val_dl:
+                x = x.to(device); y = y.to(device)
+                errs.append(self.error_fn(self.model(x), y))
+            error = np.mean(errs)
+            self.stats['val_errors'][self.t] = error
+            self.model.train()
+            return error
+
+    def train(self, 
+              num_iters: int, 
+              eval_every: int, 
+              reset_every: int,
+              wordy: bool=False) -> Dict[str, Dict[int, float]]:
         """
-        trains for `num_iters` with given batch size
+        Trains for `num_iters` with given parameters.
+        Returns the stats of the training
         
         Parameters
         ----------
         num_iters : int
             number of iterations to train
+        eval_every : int
+            how many iterations between each eval epoch on `self.val_dl`
+        reset_every : int
+            how many iterations between each training episode
+        wordy : bool
+            whether to use a progress bar
         """
-        prev_grad = None
-        grad = None
+        pbar = tqdm.trange(num_iters) if wordy else range(num_iters)
+        for t in pbar:
+            if t % reset_every == 0:
+                self.reset()
+            self.train_step()
+            if t % eval_every == 0:
+                self.eval()
+            if wordy: pbar.set_postfix({'lr': self.stats['lrs'][t], 'error': self.stats['val_errors'][1 + eval_every * (t // eval_every)]})
         
-        dl = iter(self.train_dl)
-        for _ in range(num_iters):
-            try: 
-                x, y = next(dl)
-            except StopIteration: 
-                dl = iter(self.train_dl)
-                x, y = next(dl)
-            
-            x = x.to(device); y = y.to(device)
-            g = self.train_step(x, y)
-            
-            prev_grad = grad if grad is not None else g
-            grad = g
-            
-        # compute error over entire test dataset
-        errors = self.compute_error(self.test_dl)
-        ret = {'errors': errors}
-        
-        # compute gradients
-        if grad is not None:
-            ret['grad_lr'] = -np.dot(grad, prev_grad)
-            ret['grad_mag'] = np.dot(grad, grad)
-
-        return ret
+        return self.stats

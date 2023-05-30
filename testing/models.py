@@ -42,42 +42,42 @@ class MLP(nn.Module):
     
 class CNN(nn.Module):
     def __init__(self, 
-                 input_shape: Iterable,  # should be in HxCxW
+                 input_shape: Iterable,  # should be in CxHxW
                  output_dim: int,
                  activation: nn.Module=nn.ReLU,
                  use_bias=True):
         super(CNN, self).__init__()
         
         assert len(input_shape) in [2, 3]
-        if len(input_shape) == 2: input_shape = (*input_shape, 1)
+        if len(input_shape) == 2: input_shape = (1, *input_shape)
         
         self.input_shape = input_shape
         self.output_dim = output_dim
         
         self.body = nn.Sequential(
-            nn.Conv2d(input_shape[2], 32, kernel_size=8, stride=4),
+            nn.Conv2d(input_shape[0], 32, kernel_size=3),
             activation(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            activation(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            activation(),
+            # nn.Conv2d(16, 32, kernel_size=3),
+            # activation(),
+            nn.MaxPool2d(2)
         )
         
         self.fc = nn.Sequential(
-            nn.Linear(self.feature_size(), 512, bias=use_bias),
+            nn.Flatten(),
+            nn.Linear(self.feature_size(), 32, bias=use_bias),
             activation(),
-            nn.Linear(512, self.output_dim, bias=use_bias)
+            nn.Linear(32, self.output_dim, bias=use_bias)
         )
         
     def forward(self, x) -> torch.Tensor:
-        b = x.shape[0]
         h = self.body(x)
-        h = h.view(b, -1)
         h = self.fc(h)
         return h
     
     def feature_size(self) -> int:
-        return self.body(torch.zeros(1, self.input_shape[2], *self.input_shape[:2])).view(1, -1).shape[1]
+        with torch.no_grad():
+            feature_size = self.body(torch.zeros(1, *self.input_shape)).view(1, -1).shape[1]
+        return feature_size
 
 if __name__ == '__main__':
     print('testing model dimension stuff!')
@@ -85,7 +85,12 @@ if __name__ == '__main__':
     _mlp_test = torch.zeros((1, 128))
     assert _mlp(_mlp_test).shape[1] == 16
     
-    _cnn = CNN(input_shape=(210, 160, 3), output_dim=16)
+    _cnn = CNN(input_shape=(3, 210, 160), output_dim=16)
     _cnn_test = torch.zeros((1, 3, 210, 160))
     assert _cnn(_cnn_test).shape[1] == 16
     print('yippee!')
+    
+    from testing.utils import count_parameters
+    mlp = MLP(layer_dims=[int(28 * 28), 100, 100, 100, 100, 10]).float()
+    cnn = CNN(input_shape=(28, 28), output_dim=10)
+    print(count_parameters(mlp), count_parameters(cnn))

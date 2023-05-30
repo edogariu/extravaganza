@@ -9,22 +9,26 @@ import torchvision
 from torch.utils.data import DataLoader, TensorDataset
 
 from testing.base_problem import BaseTorchProblem
+from testing.models import MLP, CNN
 from testing.utils import top_1_accuracy
 
 class TorchLinearRegression(BaseTorchProblem):
     def __init__(self, 
-                 opt_args: Dict[str, Dict],
+                 make_optimizer: Callable[[torch.nn.Module], torch.optim.Optimizer],
                  batch_size: int, 
                  n_features: int,
                  n_informative: int, 
                  n_samples: int, 
                  noise: float,
-                 seed: int = None):
+                 seed: int=None,
+                 probe_fns: Dict[str, Callable]={}):
         """
         linear regression problem in PyTorch
         
         Parameters
         ----------
+        make_optimizer : Callable[[torch.nn.Module], torch.optim.Optimizer]
+            function that makes optimizer of desired type to train the input module
         batch_size : int
             batch size of train dataloader
         n_features : int
@@ -35,76 +39,117 @@ class TorchLinearRegression(BaseTorchProblem):
             number of samples to make
         noise : float
             std of Gaussian noise to add to data points
+        seed : int
+            random seed
+        probe_fns : Dict[str, Callable]
+            functions that takes as input the `BaseTorchProblem` object and return probed values
         """
         self.batch_size = batch_size
         self.n_features = n_features
         self.n_informative = n_informative
         self.n_samples = n_samples
         self.noise = noise
-        super().__init__(opt_args, seed)
+        
+        model = self.get_model(seed=seed)
+        opt = make_optimizer(model)
+        
+        super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
+        self.loss_fn = self.error_fn = torch.nn.functional.mse_loss
         
     def get_model(self, seed: int=None) -> torch.nn.Module:
-        if seed is not None: torch.manual_seed(seed)
+        if seed is not None: 
+            torch.manual_seed(seed)
         return torch.nn.Linear(self.n_features, 1).float()
         
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
-        if seed is not None: np.random.seed(seed)
-            
+        if seed is not None: 
+            np.random.seed(seed)
         X, y = make_regression(n_samples=self.n_samples, n_features=self.n_features, n_informative=self.n_informative, noise=self.noise, random_state=seed)
-        train_x, test_x, train_y, test_y = train_test_split(X, y)
-        train_x, test_x, train_y, test_y = torch.FloatTensor(train_x), torch.FloatTensor(test_x), torch.FloatTensor(train_y).reshape(-1, 1), torch.FloatTensor(test_y).reshape(-1, 1)
+        train_x, val_x, train_y, val_y = train_test_split(X, y)
+        train_x, val_x, train_y, val_y = torch.FloatTensor(train_x), torch.FloatTensor(val_x), torch.FloatTensor(train_y).reshape(-1, 1), torch.FloatTensor(val_y).reshape(-1, 1)
         train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=self.batch_size, shuffle=True, drop_last=True)
-        test_dl = DataLoader(TensorDataset(test_x, test_y), batch_size=len(test_x), shuffle=False, drop_last=True)
-        return train_dl, test_dl
-
-    def loss_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.mse_loss(pred, targets)  # pred are in logits here
-    
-    def error_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> float:
-        return self.loss_fn(pred, targets).item()
-    
-    
+        val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=len(val_x), shuffle=False, drop_last=True)
+        return train_dl, val_dl
     
     
 class TorchMNIST(BaseTorchProblem):
     def __init__(self, 
-                opt_args: Dict[str, Dict],
-                make_model: Callable[[], torch.nn.Module],
+                make_optimizer: Callable[[torch.nn.Module], torch.optim.Optimizer],
                 batch_size: int,
-                seed: int = None):
+                model_type: str,
+                seed: int=None,
+                probe_fns: Dict[str, Callable]={}):
         """
         MNIST problem in PyTorch
         
         Parameters
         ----------
+        make_optimizer : Callable[[torch.nn.Module], torch.optim.Optimizer]
+            function that makes optimizer of desired type to train the input module
         batch_size : int
             batch size of train dataloader
+        model_type : str
+            must be one of `['mlp', 'cnn']`
+        seed : int
+            random seed
+        probe_fns : Dict[str, Callable]
+            functions that takes as input the `BaseTorchProblem` object and return probed values
         """
-        self.make_model = make_model
+        assert model_type in ['mlp', 'cnn']
         self.batch_size = batch_size
-        super().__init__(opt_args, seed)
+        model = self.get_model(model_type, seed=seed)
+        opt = make_optimizer(model)
+        super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
         
-    def get_model(self, seed: int=None) -> torch.nn.Module:
-        if seed is not None: torch.manual_seed(seed)
-        return self.make_model()
+        # preds for the loss and error are in logits, not probs!!
+        self.loss_fn = torch.nn.functional.cross_entropy
+        self.error_fn = top_1_accuracy
+        
+    def get_model(self, model_type: str, seed: int=None) -> torch.nn.Module:
+        if seed is not None: 
+            torch.manual_seed(seed)
+        if model_type == 'mlp':
+            model = MLP(layer_dims=[int(28 * 28), 100, 100, 10]).float()
+        elif model_type == 'cnn':
+            model = CNN(input_shape=(28, 28), output_dim=10)
+        else:
+            raise NotImplementedError(model_type)
+        return model.float()
         
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
-        
         train = torchvision.datasets.MNIST(root='data', train=True, download=True)
-        test = torchvision.datasets.MNIST(root='data', train=False, download=True)
+        val = torchvision.datasets.MNIST(root='data', train=False, download=True)
         train_x = train.data.float() / 128. - 0.5
-        test_x = test.data.float() / 128. - 0.5
+        val_x = val.data.float() / 128. - 0.5
         train_y = train.targets
-        test_y = test.targets
+        val_y = val.targets
         train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=self.batch_size, shuffle=True, drop_last=True)
-        test_dl = DataLoader(TensorDataset(test_x, test_y), batch_size=len(test_x), shuffle=False, drop_last=True)
-        return train_dl, test_dl
-    
-    def loss_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.cross_entropy(pred, targets)  # pred are in logits here
-    
-    def error_fn(self, pred: torch.Tensor, targets: torch.Tensor) -> float:
-        return top_1_accuracy(pred, targets)  # pred is in logits
+        val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=len(val_x), shuffle=False, drop_last=True)
+        return train_dl, val_dl
+
+PROBLEM_CLASSES = {
+    'LR': TorchLinearRegression, 
+    'MNIST MLP': TorchMNIST,
+    'MNIST CNN': TorchMNIST
+}
+
+PROBLEM_ARGS = {
+    'LR': {
+        'batch_size': 64,
+        'n_features': 100,
+        'n_informative': 30,
+        'n_samples': 1000,
+        'noise': 0.1,  # std dev of noise
+        }, 
+    'MNIST MLP': {
+        'batch_size': 64,
+        'model_type': 'mlp',
+        },
+    'MNIST CNN': {
+        'batch_size': 64,
+        'model_type': 'cnn',
+        }
+}
