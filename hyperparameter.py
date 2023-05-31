@@ -65,6 +65,7 @@ class FloatHyperparameter(FloatWrapper):
             self.t = 1
             self.B = None
             self.r = None
+            self.s = 0.1
         elif method == 'FKM':
             self.M = np.zeros(self.h + 1)  # self.M[i] = M_i^t, but self.M[-1] is the bias
             self.ns = np.zeros(self.h + 1)  # self.ns[i] = n_{t, i}, but self.ns[-1] = n_{t, 0} is the bias noise
@@ -113,9 +114,6 @@ class FloatHyperparameter(FloatWrapper):
             self.B = (1 - b_lr) * self.B + b_lr * obj * self.r / self.s
             self.B = np.clip(self.B, -self.B_clip_size, self.B_clip_size)
             B = self.B
-        
-        # print('obj={}, B={}, M={}'.format(obj, B, self.M))
-        
         pred = self.prev + self.get_value() * B  # f(x_t) + u_t * B
         w = obj - pred - self.quadratic_term * self.get_value() ** 2
         self.prev = obj
@@ -180,11 +178,6 @@ class FloatHyperparameter(FloatWrapper):
                 M, n, w = self.M[j], self.ns[j], self.ws[j]
                 u += (M + n) * w
             u += self.ns[-1]  # add bias noise
-            
-            if self.B is not None:  # add what is needed for system identification
-                self.r = np.random.randn() * self.s
-                u += self.r
-            
         elif self.method == 'REINFORCE':
             n = np.random.randn() * scale
             for j in range(min(self.h, len(self.ws))):
@@ -192,5 +185,9 @@ class FloatHyperparameter(FloatWrapper):
                 u += M * w
             u += n  # add bias noise
             self.ns.appendleft(n)
+            
+        if self.B is not None:  # add what is needed for system identification
+            self.r = np.random.randn() * self.s
+            u += self.r
         return u
     

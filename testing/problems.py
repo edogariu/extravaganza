@@ -102,9 +102,11 @@ class TorchMNIST(BaseTorchProblem):
         super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
         
         # preds for the loss and error are in logits, not probs!!
-        self.loss_fn = lambda logits, targets : torch.nn.functional.nll_loss(torch.softmax(logits, dim=-1).log(), targets)
         # self.loss_fn = torch.nn.functional.cross_entropy
-        self.error_fn = top_1_accuracy
+        # self.error_fn = top_1_accuracy
+ 
+        self.loss_fn = lambda logits, targets : torch.nn.functional.nll_loss(torch.softmax(logits, dim=-1).log(), targets)
+        self.error_fn = lambda logits, targets : torch.nn.functional.nll_loss(torch.softmax(logits, dim=-1).log(), targets)
         
     def get_model(self, model_type: str, seed: int=None) -> torch.nn.Module:
         if seed is not None: 
@@ -116,19 +118,36 @@ class TorchMNIST(BaseTorchProblem):
         else:
             raise NotImplementedError(model_type)
         return model.float()
-        1
+        
+        
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
-        train = torchvision.datasets.MNIST(root='data', train=True, download=True)
-        val = torchvision.datasets.MNIST(root='data', train=False, download=True)
-        train_x = train.data.float() / 128. - 0.5
-        val_x = val.data.float() / 128. - 0.5
-        train_y = train.targets
-        val_y = val.targets
-        train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=self.batch_size, shuffle=True, drop_last=True)
-        val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=len(val_x), shuffle=False, drop_last=True)
+        
+        train_dl = DataLoader(
+            torchvision.datasets.MNIST('./data', train=True, download=True,
+                           transform=torchvision.transforms.Compose([
+                               torchvision.transforms.ToTensor(),
+                               torchvision.transforms.Normalize((0.1307,), (0.3081,))
+                           ])),
+            batch_size=self.batch_size, shuffle=True, drop_last=True)
+        val_dl = DataLoader(
+            torchvision.datasets.MNIST('./data', train=False, download=True,
+                           transform=torchvision.transforms.Compose([
+                               torchvision.transforms.ToTensor(),
+                               torchvision.transforms.Normalize((0.1307,), (0.3081,))
+                           ])),
+            batch_size=self.batch_size, shuffle=False, drop_last=True)
+        
+        # train = torchvision.datasets.MNIST(root='data', train=True, download=True)
+        # val = torchvision.datasets.MNIST(root='data', train=False, download=True)
+        # train_x = train.data.float() / 128. - 0.5
+        # val_x = val.data.float() / 128. - 0.5
+        # train_y = train.targets
+        # val_y = val.targets
+        # train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=self.batch_size, shuffle=True, drop_last=True)
+        # val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=len(val_x), shuffle=False, drop_last=True)
         return train_dl, val_dl
 
 PROBLEM_CLASSES = {
