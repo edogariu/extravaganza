@@ -112,6 +112,7 @@ class BaseTorchProblem:
         # probe and cache desired quantities
         loss = loss.item()
         self.stats['train_losses'][self.t] = loss
+        self.last_loss = loss
         lr = self.opt.param_groups[0]['lr']
         self.stats['lrs'][self.t] = lr if not hasattr(lr, 'item') else lr.item()
         try:
@@ -123,7 +124,6 @@ class BaseTorchProblem:
             self.stats[k][self.t] = f(self)
             
         self.t += 1
-        self.last_loss = loss
         return loss
     
     def eval(self):
@@ -165,6 +165,6 @@ class BaseTorchProblem:
             self.train_step()
             if t % eval_every == 0:
                 self.eval()
-            if wordy: pbar.set_postfix({'lr': self.stats['lrs'][t], 'error': self.stats['val_errors'][1 + eval_every * (t // eval_every)]})
+            if wordy: pbar.set_postfix({'lr': self.stats['lrs'][t], 'loss': self.last_loss})
         
         return self.stats

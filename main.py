@@ -18,17 +18,17 @@ from testing.problems import PROBLEM_CLASSES, PROBLEM_ARGS
 from testing.utils import window_average
 
 def main():
-    use_multiprocessing = True
+    use_multiprocessing = False
     
     num_iters = 7000
-    num_trials = 8
+    num_trials = 1
     step_every = 1
-    eval_every = 20
-    reset_every = 1000
-    window_size = 40
+    eval_every = 100
+    reset_every = 200000000
+    window_size = 4
     seed = None
     
-    problem = 'LR' # ['LR', 'MNIST MLP', 'MNIST CNN']
+    problem = 'MNIST CNN' # ['LR', 'MNIST MLP', 'MNIST CNN']
 
     lr_args = {
         'h': 5,
@@ -37,11 +37,11 @@ def main():
         'interval': (-1, 1),
         'nonnegative': True,
         'quadratic_term': 1,
-        'w_clip_size': 0.5,
-        # 'M_clip_size': 0.5,
-        'B_clip_size': 0.5,
-        'cost_clip_size': 0.5,
-        'method': 'FKM',
+        'w_clip_size': 1,
+        # 'M_clip_size': 1,
+        'B_clip_size': 1,                                  
+        'cost_clip_size': 1,
+        'method': 'REINFORCE',
     }    
     momentum_args = {
         'h': 5,
@@ -54,17 +54,17 @@ def main():
         # 'M_clip_size': 1,
         'B_clip_size': 0.5,
         'cost_clip_size': 0.5,
-        'method': 'FKM',
+        'method': 'REINFORCE',
     }    
     optimizers = {
         # 'ours (lr)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), step_every=step_every),
         # 'ours (lr) +m': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=0.9, step_every=step_every),
         # 'ours (m)': lambda model: SGD(model.parameters(), lr=0.01, momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
-        'ours (lr, m)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
-        'SGD': lambda model: torch.optim.SGD(model.parameters(), lr=0.1),
-        'SGD +m': lambda model: torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9),
-        # 'SGDHD': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.1, hypergrad_lr=1e-7),
-        # 'SGDHD +m': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.01, hypergrad_lr=5e-8, momentum=0.9),
+        # 'ours (lr, m)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
+        # 'SGD': lambda model: torch.optim.SGD(model.parameters(), lr=0.1),
+        # 'SGD +m': lambda model: torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9),
+        # 'SGDHD': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.001, hypergrad_lr=3e-5),
+        'SGDHD +m': lambda model: hypergrad.SGDHD(model.parameters(), lr=0.001, hypergrad_lr=0.001, momentum=0.9, weight_decay=1e-4),
         # 'ADAM': lambda model: torch.optim.Adam(model.parameters(), lr=0.1, weight_decay=1e-5),
     }
     
@@ -122,7 +122,7 @@ def plot_results(results, window_size, problem):
     
     ax[0, 0].set_title('{} learning rate'.format(problem))
     ax[0, 0].legend()
-    ax[0, 0].set_ylim([0, 0.4])
+    ax[0, 0].set_ylim([0, 2])
     
     ax[0, 1].set_title('{} momentum'.format(problem))
     ax[0, 1].legend()

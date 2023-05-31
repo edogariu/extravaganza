@@ -70,6 +70,7 @@ class CNN(nn.Module):
         )
         
     def forward(self, x) -> torch.Tensor:
+        x = x.reshape(-1, *self.input_shape)
         h = self.body(x)
         h = self.fc(h)
         return h

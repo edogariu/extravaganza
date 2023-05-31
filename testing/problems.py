@@ -102,20 +102,21 @@ class TorchMNIST(BaseTorchProblem):
         super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
         
         # preds for the loss and error are in logits, not probs!!
-        self.loss_fn = torch.nn.functional.cross_entropy
+        self.loss_fn = lambda logits, targets : torch.nn.functional.nll_loss(torch.softmax(logits, dim=-1).log(), targets)
+        # self.loss_fn = torch.nn.functional.cross_entropy
         self.error_fn = top_1_accuracy
         
     def get_model(self, model_type: str, seed: int=None) -> torch.nn.Module:
         if seed is not None: 
             torch.manual_seed(seed)
         if model_type == 'mlp':
-            model = MLP(layer_dims=[int(28 * 28), 100, 100, 10]).float()
+            model = MLP(layer_dims=[int(28 * 28), 1000, 1000, 10]).float()
         elif model_type == 'cnn':
             model = CNN(input_shape=(28, 28), output_dim=10)
         else:
             raise NotImplementedError(model_type)
         return model.float()
-        
+        1
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
         if seed is not None:
             torch.manual_seed(seed)
@@ -145,7 +146,7 @@ PROBLEM_ARGS = {
         'noise': 0.1,  # std dev of noise
         }, 
     'MNIST MLP': {
-        'batch_size': 64,
+        'batch_size': 128,
         'model_type': 'mlp',
         },
     'MNIST CNN': {
