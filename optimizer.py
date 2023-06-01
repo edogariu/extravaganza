@@ -129,18 +129,20 @@ class SGD(Optimizer):
         
         # LR UPDATE STEP
         if isinstance(group['lr'], FloatHyperparameter) and self.t % self.step_every == 0:
-            grad_lr = -torch.dot(grad, grad_prev)
-            B = -torch.dot(grad, grad)
+            import numpy as np
+            if np.isnan(lr): exit(0)
+            
+            grad_lr = -torch.dot(grad, grad_prev).detach().cpu().data.numpy()
+            B = -torch.dot(grad, grad).detach().cpu().data.numpy()
             if momentum != 0 and 'momentum_buffer' in state: 
-                B -= momentum * torch.dot(state['momentum_buffer'], state['momentum_buffer'])
-            # group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
+                B -= momentum * torch.dot(state['momentum_buffer'], grad).detach().cpu().data.numpy()
+            group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
             # group['lr'].step(obj=error, B=B)  # with estimating gradients
-            group['lr'].step(obj=error)  # with estimating gradients and system info!
+            # group['lr'].step(obj=error)  # with estimating gradients and system info!
         
         # MOMENTUM UPDATE STEP
         if isinstance(group['momentum'], FloatHyperparameter) and self.t % self.step_every == 0 and momentum != 0 and 'momentum_buffer' in state:
-            B = -lr * torch.dot(grad, grad) / momentum
-            B -= lr * torch.dot(state['momentum_buffer'], state['momentum_buffer'])
+            B = -lr * torch.dot(state['momentum_buffer'], grad).detach().cpu().data.numpy()
             group['momentum'].step(obj=error, B=B)  # with estimating gradients
 
         if momentum != 0:

@@ -18,48 +18,47 @@ from testing.problems import PROBLEM_CLASSES, PROBLEM_ARGS
 from testing.utils import window_average
 
 def main():
-    use_multiprocessing = True
+    use_multiprocessing = False
     
-    num_iters = 5000
-    num_trials = 8
+    num_iters = 7000
+    num_trials = 1
     step_every = 1
-    eval_every = 50
+    eval_every = 20
     reset_every = 1000
-    window_size = 40
+    window_size = num_iters // 200
     seed = None
     
     problem = 'LR' # ['LR', 'MNIST MLP', 'MNIST CNN']
 
     lr_args = {
         'h': 5,
-        'initial_value': 1,
-        'initial_scale': 0.1,
-        'interval': (-1, 1),
-        'nonnegative': True,
-        'quadratic_term': 1,
-        'w_clip_size': 1,
-        # 'M_clip_size': 1,
-        'B_clip_size': 1,                                  
-        'cost_clip_size': 1,
-        'method': 'REINFORCE',
+        'initial_value': 0.05,
+        'interval': (0, 1),
+        'rescale': True,
+        'quadratic_term': 0,
+        # 'w_clip_size': 1,
+        # 'M_clip_size': 1e-9,
+        # 'B_clip_size': 1,  
+        # 'grad_clip_size': 1,                                
+        # 'cost_clip_size': 1,
+        'method': 'FKM',
     }    
     momentum_args = {
         'h': 5,
-        'initial_value': 0.3,
-        'initial_scale': 0.2,
-        'interval': (-0.99, 0.99),
-        'nonnegative': True,
-        'quadratic_term': 1,
-        'w_clip_size': 0.5,
-        # 'M_clip_size': 1,
-        'B_clip_size': 0.5,
-        'cost_clip_size': 0.5,
+        'initial_value': 0.2,
+        'interval': (0, 0.99),
+        'rescale': True,
+        'quadratic_term': 0,
+        # 'w_clip_size': 0.5,
+        # 'M_clip_size': 1e-7,
+        # 'B_clip_size': 0.5,
+        # 'cost_clip_size': 0.5,
         'method': 'REINFORCE',
     }    
     optimizers = {
         'ours (lr)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), step_every=step_every),
         # 'ours (lr) +m': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=0.9, step_every=step_every),
-        # 'ours (m)': lambda model: SGD(model.parameters(), lr=0.01, momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
+        # 'ours (m)': lambda model: SGD(model.parameters(), lr=0.05, momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
         # 'ours (lr, m)': lambda model: SGD(model.parameters(), lr=FloatHyperparameter(**lr_args), momentum=FloatHyperparameter(**momentum_args), step_every=step_every),
         'SGD': lambda model: torch.optim.SGD(model.parameters(), lr=0.1),
         # 'SGD +m': lambda model: torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9),
@@ -91,18 +90,18 @@ def plot_results(results, window_size, problem):
         ax[0, 0].plot(stats['lrs']['ts'], means, label=opt_name)
         ax[0, 0].fill_between(stats['lrs']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-        # plot momentum
-        means = window_average(stats['momenta']['means'], window_size)
-        stds = window_average(stats['momenta']['stds'], window_size)
-        ax[0, 1].plot(stats['momenta']['ts'], means, label=opt_name)
-        ax[0, 1].fill_between(stats['momenta']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # # plot momentum
+        # means = window_average(stats['momenta']['means'], window_size)
+        # stds = window_average(stats['momenta']['stds'], window_size)
+        # ax[0, 1].plot(stats['momenta']['ts'], means, label=opt_name)
+        # ax[0, 1].fill_between(stats['momenta']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-        # # plot disturbances
-        # if 'ours' in opt_name:
-        #     means = window_average(stats['disturbances']['means'], window_size)
-        #     stds = window_average(stats['disturbances']['stds'], window_size)
-        #     ax[0, 1].plot(stats['disturbances']['ts'], means, label=opt_name)
-        #     ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # plot disturbances
+        if 'ours' in opt_name:
+            means = window_average(stats['disturbances']['means'], window_size)
+            stds = window_average(stats['disturbances']['stds'], window_size)
+            ax[0, 1].plot(stats['disturbances']['ts'], means, label=opt_name)
+            ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
         # plot train losses
         means = window_average(stats['train_losses']['means'], window_size)
@@ -124,15 +123,15 @@ def plot_results(results, window_size, problem):
     ax[0, 0].legend()
     ax[0, 0].set_ylim([0, 0.4])
     
-    ax[0, 1].set_title('{} momentum'.format(problem))
-    ax[0, 1].legend()
-    ax[0, 1].set_ylim([0, 1.])
-    # ax[0, 1].set_title('{} disturbances'.format(problem))
+    # ax[0, 1].set_title('{} momentum'.format(problem))
     # ax[0, 1].legend()
+    # ax[0, 1].set_ylim([0, 1.])
+    ax[0, 1].set_title('{} disturbances'.format(problem))
+    ax[0, 1].legend()
     
     ax[1, 0].set_title('{} train losses'.format(problem))
     ax[1, 0].legend()
-    ax[1, 0].set_ylim([0, 1. if 'MNIST' in problem else 0.15])
+    ax[1, 0].set_ylim([0, 0.3 if 'MNIST' in problem else 0.03])
     
     ax[1, 1].set_title('{} val errors'.format(problem))
     ax[1, 1].legend()

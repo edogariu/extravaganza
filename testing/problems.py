@@ -54,7 +54,8 @@ class TorchLinearRegression(BaseTorchProblem):
         opt = make_optimizer(model)
         
         super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
-        self.loss_fn = self.error_fn = torch.nn.functional.mse_loss
+        self.loss_fn = self.error_fn = torch.nn.functional.mse_loss 
+        # self.loss_fn = self.error_fn = lambda preds, targets: torch.nn.functional.mse_loss(preds, targets) / 10
         
     def get_model(self, seed: int=None) -> torch.nn.Module:
         if seed is not None: 
