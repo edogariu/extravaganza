@@ -124,6 +124,8 @@ class SGD(Optimizer):
         # State initialization
         if len(state) == 0:
             state['grad_prev'] = torch.zeros_like(grad)
+            state['prev_lr'] = 0
+            state['prev_momentum'] = 0
 
         grad_prev = state['grad_prev']
         
@@ -133,16 +135,16 @@ class SGD(Optimizer):
             if np.isnan(lr): exit(0)
             
             grad_lr = -torch.dot(grad, grad_prev).detach().cpu().data.numpy()
-            B = -torch.dot(grad, grad).detach().cpu().data.numpy()
+            B = -torch.dot(grad_prev, grad_prev).detach().cpu().data.numpy()
             if momentum != 0 and 'momentum_buffer' in state: 
-                B -= momentum * torch.dot(state['momentum_buffer'], grad).detach().cpu().data.numpy()
-            group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
-            # group['lr'].step(obj=error, B=B)  # with estimating gradients
+                B -= state['prev_momentum'] * torch.dot(state['momentum_buffer'], grad_prev).detach().cpu().data.numpy()
+            # group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
+            group['lr'].step(obj=error, B=B)  # with estimating gradients
             # group['lr'].step(obj=error)  # with estimating gradients and system info!
         
         # MOMENTUM UPDATE STEP
         if isinstance(group['momentum'], FloatHyperparameter) and self.t % self.step_every == 0 and momentum != 0 and 'momentum_buffer' in state:
-            B = -lr * torch.dot(state['momentum_buffer'], grad).detach().cpu().data.numpy()
+            B = -state['prev_lr'] * torch.dot(state['momentum_buffer'], grad_prev).detach().cpu().data.numpy()
             group['momentum'].step(obj=error, B=B)  # with estimating gradients
 
         if momentum != 0:
@@ -158,6 +160,8 @@ class SGD(Optimizer):
                 grad = buf
 
         state['grad_prev'] = grad
+        state['prev_lr'] = lr
+        state['prev_momentum'] = momentum
 
         self._add_grad(-lr, grad)
         self.t += 1

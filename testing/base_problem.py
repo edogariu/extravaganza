@@ -41,11 +41,11 @@ class BaseTorchProblem:
         self.probe_fns = probe_fns
         
         self.t = 0
+        self.last_loss = 0
         self.stats = {'train_losses': {},
                       'val_errors': {},
                       'lrs': {},
                       'momenta': {}}
-        self.last_loss = 0
         for k in self.probe_fns.keys():
             self.stats[k] = {}
             
@@ -107,12 +107,12 @@ class BaseTorchProblem:
         self.opt.zero_grad()
         loss = self.loss_fn(self.model(x), y)
         loss.backward()
+        loss = loss.item()
+        self.last_loss = loss
         self.opt.step()
         
         # probe and cache desired quantities
-        loss = loss.item()
         self.stats['train_losses'][self.t] = loss
-        self.last_loss = loss
         lr = self.opt.param_groups[0]['lr']
         self.stats['lrs'][self.t] = lr if not hasattr(lr, 'item') else lr.item()
         try:

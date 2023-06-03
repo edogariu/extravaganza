@@ -4,7 +4,7 @@ import numpy as np
 
 from wrappers import FloatWrapper
 
-TRANSFORMATION = 'w_sigmoid'  # ['sigmoid', 'rescale', 'w_sigmoid', 'w_rescale']
+TRANSFORMATION = 'w_rescale'  # ['sigmoid', 'rescale', 'w_sigmoid', 'w_rescale']
 
 def sigmoid(t):
     return 1 / (1 + np.exp(-t))
@@ -80,7 +80,7 @@ class FloatHyperparameter(FloatWrapper):
                  M_clip_size: float=float('inf'), 
                  B_clip_size: float=float('inf'),
                  cost_clip_size: float=float('inf'), 
-                 grad_clip_size: float=float('inf'),
+                 update_clip_size: float=float('inf'),
                  quadratic_term: float=0,
                  rescale: bool=False,
                  method='FKM'):
@@ -99,7 +99,7 @@ class FloatHyperparameter(FloatWrapper):
         M_clip_size : float
         B_clip_size : float
         cost_clip_size : float
-        grad_clip_size : float
+        update_clip_size : float
         quadratic_term : float
         rescale : bool
         method : str
@@ -112,7 +112,7 @@ class FloatHyperparameter(FloatWrapper):
         self.M_clip_size = M_clip_size
         self.B_clip_size = B_clip_size
         self.cost_clip_size = cost_clip_size
-        self.grad_clip_size = grad_clip_size
+        self.update_clip_size = update_clip_size
         self.quadratic_term = quadratic_term
         self.rescale_u = rescale and TRANSFORMATION[:2] != 'w_'
         self.rescale_w = rescale and TRANSFORMATION[:2] == 'w_'
@@ -128,21 +128,29 @@ class FloatHyperparameter(FloatWrapper):
         self.interval = interval
         
         # dynamic parameters of the optimization
+        # for meta lr ADAM
+        self.m = np.zeros(self.h + 1)  # first order estimate
+        self.v = np.zeros(self.h + 1)  # second order estimate
+        self.meta_lr = 0.01
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.eps = 1e-8
+        
         self.M = np.zeros(self.h + 1)  # self.M[i] = M_i^t, but self.M[-1] is the bias
         self.M[-1] = self.value[0]
-        self.D = 1  # D_t, distance in M-space traveled during the optimization 
-        self.prev = None  # previous cost f(x_t)
+        self.prev_obj = None  # previous cost f(x_t)
+        self.prev_value = self.get_value()  # previous value u_{t-1}
         self.t = 1  # timestep t
         self.B = None  # keep track of system estimates B_t, if needed
         self.r = None  # random variable to estimate system parameter B, if needed
         self.scale = None  # keep track of current scale G_t
-        self.G0 = None  # keep track of initial scale G_0
+        self.sigma = None
         if method == 'FKM':
             self.ns = np.zeros(self.h + 1)  # self.ns[i] = n_{t, i}, but self.ns[-1] = n_{t, 0} is the bias noise
-            self.ws = deque(maxlen=self.h)  # self.ws[i] = epsilon_{t-i-1}
+            self.ws = deque([0 for _ in range(self.h)], maxlen=self.h)  # self.ws[i] = epsilon_{t-i-1}
         elif method == 'REINFORCE':
-            self.ns = deque(maxlen=self.h)  # self.ns[i] = n_{t-i}
-            self.ws = deque(maxlen=2 * self.h)  # self.ws[i] = epsilon_{t-i-1}
+            self.ns = deque([0 for _ in range(self.h + 1)], maxlen=self.h + 1)  # self.ns[i] = n_{t-i}
+            self.ws = deque([0 for _ in range(2 * self.h)], maxlen=2 * self.h)  # self.ws[i] = epsilon_{t-i-1}
         else:
             raise NotImplementedError()
     
@@ -174,11 +182,11 @@ class FloatHyperparameter(FloatWrapper):
         if B is not None: B = np.clip(B, -self.B_clip_size, self.B_clip_size)
         
         # cache observation on first step
-        if self.prev is None:
+        if self.prev_obj is None:
             if obj == 0: return  
-            self.prev = obj
-            self.scale = self.G0 = abs(obj)
-            self.sigma = min(0.1, self.G0)
+            self.prev_obj = obj
+            self.scale = abs(obj)
+            self.sigma = min(0.5, self.scale)
             if B is None:
                 self.r = np.random.randn() * self.sigma
                 self.B = self.r * obj
@@ -190,70 +198,60 @@ class FloatHyperparameter(FloatWrapper):
             self.B = (1 - b_lr) * self.B + b_lr * obj * self.r / self.sigma
             self.B = np.clip(self.B, -self.B_clip_size, self.B_clip_size)
             B = self.B
-        pred = self.prev + self.get_value() * B  # \hat{s_t} = f(x_{t-1}) + u_{t-1} * B
-        w = obj - pred - self.quadratic_term * self.get_value() ** 2  # w_t = s_t - \hat{s_t} (maybe with - u_{t-1}^2)
-        self.prev = (1 - 0.1) * obj
-               
-        # set scale
-        self.sigma = min(0, self.G0 / (self.t ** 0.25))
-        # self.scale = max(self.scale, abs(obj))
-        scale_lr = 0.01# 1 / (self.t ** 0.5)
-        self.scale = (1 - scale_lr) * self.scale + scale_lr * obj
-        self.D = max(self.D, np.linalg.norm(self.M))
-        meta_lr = self.D / (self.scale * self.t ** 0.5)
+        pred = self.prev_obj + self.prev_value * B  # \hat{s_t} = f(x_{t-1}) + B
+        w = obj - pred - self.quadratic_term * self.prev_value ** 2  # w_t = s_t - \hat{s_t} (maybe with - u_{t-1}^2)
+        self.prev_obj = obj
                 
-        # update
+        # calc gradients
+        grad = np.zeros(self.h + 1)
         if grad_u is not None:
-            grad = grad_u * np.array(self.ws)[:self.h]
-            grad_bias = grad_u
+            grad[:-1] = grad_u * np.array(self.ws)[:self.h]
+            grad[-1] = grad_u
         else:
             if self.method == 'FKM':
-                grad = self.ns[:-1] * obj / self.sigma
-                grad_bias = self.ns[-1] * obj / self.sigma
+                grad = self.ns * obj / self.sigma
             elif self.method == 'REINFORCE':
-                grad = np.array(self.ns)[1:] * np.array(self.ws)[:len(self.ns) - 1] * obj / self.sigma
-                grad_bias = self.ns[0] * obj / self.sigma if len(self.ns) > 0 else 0
+                grad[:-1] = np.array(self.ns)[1:] * np.array(self.ws)[:self.h] * obj / self.sigma
+                grad[-1] = self.ns[0] * obj / self.sigma
+        if self.rescale_u: grad *= d_rescale(float(self.value[0]), self.interval)
+        elif self.rescale_w: grad *= d_rescale_11(float(self.value[0]), self.interval)
+        
+        # compute scale and update
+        scale_lr = 0.01# 1 / (self.t ** 0.5)
+        self.scale = (1 - scale_lr) * self.scale + scale_lr * abs(obj)
+        # self.scale = max(self.scale, abs(obj))
+        self.sigma = min(0.01, self.scale / (self.t ** 0.25))
+        update = self._compute_update(grad)
+        update = np.clip(update, -self.update_clip_size, self.update_clip_size)
+        self.M -= update
                 
-        if self.rescale_u:
-            d = d_rescale(self.value[0], self.interval)
-            grad *= d
-            grad_bias *= d
-        elif self.rescale_w:
-            d = d_rescale_11(self.value[0], self.interval)
-            grad *= d
-            grad_bias *= d
-            
-        print('u_t={:.4f} \tG_t={:.4f} \tD_t={:.4f}'.format(self.get_value(), self.scale, self.D), 
-        '\nsigma_t={:.4f} \teta_t={} \t||grad||={:.4f}'.format(self.sigma, meta_lr, np.linalg.norm([*grad, grad_bias])), 
-        '\tB={:.4f} \n\tM={} \n\tw={}'.format(B, self.M.round(3), np.array(self.ws)[:self.h].round(3)))
-        
-        grad = np.clip(grad, -self.grad_clip_size, self.grad_clip_size)
-        grad_bias = np.clip(grad_bias, -self.grad_clip_size, self.grad_clip_size)
-        # grad /= np.maximum(1, np.abs(grad)); grad_bias /= max(1, np.abs(grad_bias))
-        self.M[:len(grad)] -= meta_lr * grad
-        self.M[-1] -= meta_lr * grad_bias
-        
         # clip some more
         w = np.clip(w, -self.w_clip_size, self.w_clip_size)
         if self.rescale_w: 
-            w_scale = self.G0
+            w = w / np.maximum(1, np.abs(w))
             v = 0.5
-            w = rescale(w, [-w_scale, w_scale]) / w_scale  # w \in [-1, 1]
-            self.M[:-1] = np.clip(self.M[:-1], -v / self.h, v / self.h)  # M \cdot w \in [-1, 1]
+            # w_scale = self.scale
+            # w = rescale(w, [-w_scale, w_scale])  # w \in [-w_scale, w_scale]
+            self.M[:-1] = np.clip(self.M[:-1], -v / self.h, v / self.h)  # M \cdot w \in [-v, v]
             self.M[-1] = np.clip(self.M[-1], -(1 - v), 1 - v)
         else:
-            w = np.clip(w, -self.G0, self.G0)
+            # w = np.clip(w, -self.scale, self.scale)
             self.M[:-1] = np.clip(self.M[:-1], -self.M_clip_size, self.M_clip_size)
+        
+        # print('u_t={:.4f} \tG_t={:.4f} \t||grad||={:.4f} \tsigma_t={:.4f}\tB={:.4f}'.format(self.get_value(), self.scale, np.linalg.norm(grad), self.sigma, B), 
+        # '\n\tdelta_t={} '.format(update), 
+        # '\n\tM={} \n\tw={}'.format(self.M, np.array(self.ws)[:self.h]))
 
         # play u_{t + 1}
         self.t += 1
         self.ws.appendleft(w)
         u = self._compute_u()
+        self.prev_value = self.get_value()
         self.set_value(u)        
         pass
 
     def _compute_u(self):
-        u = self.M[-1] #+ self.initial_value
+        u = self.M[-1]
         if self.method == 'FKM':
             self.ns = np.random.randn(self.h + 1) * self.sigma
             for j in range(min(self.h, len(self.ws))):
@@ -272,4 +270,13 @@ class FloatHyperparameter(FloatWrapper):
             self.r = np.random.randn() * self.sigma
             u += self.r
         return u
+
+    def _compute_update(self, grad):
+        t = self.t
+        # given array of gradients, compute ADAM update
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grad
+        self.v = self.beta2 * self.v + (1 - self.beta2) * grad ** 2
+        alpha_t = self.meta_lr * np.sqrt(1 - self.beta2 ** t) / (1 - self.beta1 ** t)
+        update = alpha_t * self.m / (self.v ** 0.5 + self.eps)
+        return update
     

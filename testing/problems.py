@@ -54,8 +54,8 @@ class TorchLinearRegression(BaseTorchProblem):
         opt = make_optimizer(model)
         
         super().__init__(model, opt, seed=seed, probe_fns=probe_fns)
-        self.loss_fn = self.error_fn = torch.nn.functional.mse_loss 
-        # self.loss_fn = self.error_fn = lambda preds, targets: torch.nn.functional.mse_loss(preds, targets) / 10
+        # self.loss_fn = self.error_fn = torch.nn.functional.mse_loss 
+        self.loss_fn = self.error_fn = lambda preds, targets: torch.nn.functional.mse_loss(preds, targets)
         
     def get_model(self, seed: int=None) -> torch.nn.Module:
         if seed is not None: 
@@ -65,6 +65,7 @@ class TorchLinearRegression(BaseTorchProblem):
     def get_dataset(self, seed: int=None) -> Tuple[DataLoader, DataLoader]:
         if seed is not None: 
             np.random.seed(seed)
+        np.random.seed(0)
         X, y = make_regression(n_samples=self.n_samples, n_features=self.n_features, n_informative=self.n_informative, noise=self.noise, random_state=seed)
         train_x, val_x, train_y, val_y = train_test_split(X, y)
         train_x, val_x, train_y, val_y = torch.FloatTensor(train_x), torch.FloatTensor(val_x), torch.FloatTensor(train_y).reshape(-1, 1), torch.FloatTensor(val_y).reshape(-1, 1)
@@ -159,14 +160,14 @@ PROBLEM_CLASSES = {
 
 PROBLEM_ARGS = {
     'LR': {
-        'batch_size': 64,
+        'batch_size': 1,
         'n_features': 100,
         'n_informative': 30,
         'n_samples': 1000,
         'noise': 0.1,  # std dev of noise
         }, 
     'MNIST MLP': {
-        'batch_size': 128,
+        'batch_size': 256,
         'model_type': 'mlp',
         },
     'MNIST CNN': {

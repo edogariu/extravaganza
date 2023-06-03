@@ -3,6 +3,8 @@ data
 code_graveyard*
 old*
 test.py
+exdata
+coco
 
 
 # Byte-compiled / optimized / DLL files
