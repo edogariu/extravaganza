@@ -3,29 +3,10 @@ from collections import deque
 import numpy as np
 
 from wrappers import FloatWrapper
-from utils import EMA_RESCALE, ADAM, D_ADAM, DoWG, sigmoid, d_sigmoid, inv_sigmoid
+from rescalers import EMA_RESCALE, ADAM, D_ADAM, DoWG
+from utils import rescale, d_rescale, inv_rescale
 
-use_sigmoid = True
-
-def rescale(t, bounds):
-    """
-    rescales from `[0, 1] -> [tmin, tmax]`
-    """
-    tmin, tmax = bounds
-    if use_sigmoid: t = sigmoid(t)
-    return tmin + (tmax - tmin) * t
-
-def d_rescale(t, bounds):
-    tmin, tmax = bounds
-    d = tmax - tmin
-    if use_sigmoid: d *= d_sigmoid(t)
-    return d
-
-def inv_rescale(s, bounds):
-    tmin, tmax = bounds
-    t = (s - tmin) / (tmax - tmin)
-    if use_sigmoid: t = inv_sigmoid(t)
-    return t
+USE_SIGMOID = True
 
 class FloatController(FloatWrapper):
     def __init__(self, 
@@ -67,13 +48,13 @@ class FloatController(FloatWrapper):
         
         self.bounds = bounds
         self.umin, self.umax = bounds
-        super().__init__(inv_rescale(initial_value, self.bounds))
+        super().__init__(inv_rescale(initial_value, self.bounds, USE_SIGMOID))
         
         # dynamic parameters of the optimization
         # for meta lr updates
-        # self.update = ADAM(alpha=0.01, betas=(0.9, 0.999))
-        self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.02, use_bias_correction=True)
-        # self.update = DoWG(alpha=1e5)
+        # self.update = ADAM(alpha=0.001, betas=(0.9, 0.999))
+        self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.02, use_bias_correction=False)
+        # self.update = DoWG(alpha=1e4)
         # self.obj = ADAM(betas=(0.9, 0.999))
         # self.obj = EMA_RESCALE(beta=0)
         
@@ -96,7 +77,7 @@ class FloatController(FloatWrapper):
             raise NotImplementedError()
     
     def get_value(self) -> float:  # rescale u_t if needed
-        return rescale(super().get_value(), self.bounds)
+        return rescale(super().get_value(), self.bounds, USE_SIGMOID)
     
     def step(self, obj: float, B: float=None, grad_u: float=None):
         """
@@ -147,7 +128,7 @@ class FloatController(FloatWrapper):
         # scale_lr = 0.01# 1 / (self.t ** 0.5)
         # self.scale = (1 - scale_lr) * self.scale + scale_lr * abs(obj)
         self.scale = max(self.scale, abs(obj))
-        self.sigma = min(0.01, self.scale / (self.t ** 0.25))
+        self.sigma = min(0.1, self.scale / (self.t ** 0.25)) if (grad_u is None or self.B is not None) else 0
                 
         # calc gradients and update
         grad = np.zeros(self.h + 1)
@@ -161,10 +142,10 @@ class FloatController(FloatWrapper):
                 grad[:-1] = np.array(self.ns)[1:] * np.array(self.ws)[:self.h] * obj / self.sigma
                 grad[-1] = self.ns[0] * obj / self.sigma
                 
-        grad *= d_rescale(float(self.value[0]), self.bounds)
+        grad *= d_rescale(float(self.value[0]), self.bounds, USE_SIGMOID)
         update = self.update.step(grad, iterate=self.M)
         
-        if self.t < self.h:  # only observe for `h` steps
+        if self.t < 50:  # only observe in the beginning
             self.t += 1
             self.ws.appendleft(w)
             return

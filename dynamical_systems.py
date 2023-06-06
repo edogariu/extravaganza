@@ -12,8 +12,9 @@ from torch.utils.data import DataLoader
 import torchvision
 import jax
 
-from testing.models import MLP, CNN
-from testing.utils import device
+from controller import FloatController
+from models import MLP, CNN
+from utils import device
 
 class DynamicalSystem:
     @abstractmethod
@@ -82,7 +83,7 @@ class LinearRegression(DynamicalSystem):
         self.reset()
         pass
     
-    def interact(self, control) -> float:
+    def interact(self, control: FloatController) -> float:
         # train step
         self.opt.zero_grad()
         train_loss = torch.nn.functional.mse_loss(self.model(self.train_x), self.train_y)
@@ -179,7 +180,7 @@ class MNIST(DynamicalSystem):
         self.reset()
         pass
     
-    def interact(self, control) -> float:
+    def interact(self, control: FloatController) -> float:
         # train step
         try: 
             x, y = next(self.dl)
@@ -266,21 +267,27 @@ class COCO(DynamicalSystem):
         # self.initial_x = self.problem.initial_solution_proposal()  # fixed init
         self.initial_x = self.problem.lower_bounds + np.random.rand(self.problem.dimension) * (self.problem.upper_bounds - self.problem.lower_bounds)  # random init
         self.interval = (self.problem.lower_bounds[u_index], self.problem.upper_bounds[u_index])
-        self.problem = lambda x: ((x - 2) ** 2).mean()
-          
+        self.probe_fns = probe_fns
+        
+        self.reset()
+        pass
+    
+    def reset(self, seed: int=None):
+        super().reset(seed)
+        
+        self.x = self.initial_x.copy()
+        
         # stats to keep track of
         self.t = 0
         self.stats = {'controls': {},
                       'objectives': {}}
-        self.probe_fns = probe_fns
         self.stats.update({k: {} for k in self.probe_fns.keys()})
         
         # find optimal control
-        self.reset()
         _n = 10000
         _test = np.tile(self.x, _n).reshape(_n, -1)
-        _test[:, u_index] = np.linspace(*self.interval, _n)
-        gt_controls = _test[:, u_index]
+        _test[:, self.u_index] = np.linspace(*self.interval, _n)
+        gt_controls = _test[:, self.u_index]
         gt_values = [self.problem(_t) for _t in _test]
         optimal_control = gt_controls[np.argmin(gt_values)]
         self.stats['optimal_control'] = {'value': optimal_control}
@@ -288,17 +295,10 @@ class COCO(DynamicalSystem):
         self.stats['gt_values'] = {'value': gt_values}
         pass
     
-    def reset(self, seed: int=None):
-        super().reset(seed)
-        self.x = self.initial_x.copy()
-        self.t = 0
-        for k in self.stats.keys(): 
-            if k not in ['optimal_control', 'gt_controls', 'gt_values']: self.stats[k] = {}
-    
     def get_init(self) -> Tuple[float, Tuple[float, float]]:  # returns initial value and desired interval
         return self.x[self.u_index], self.interval
         
-    def interact(self, control: float):
+    def interact(self, control: FloatController):
         if hasattr(control, 'item'): 
             c = control.item() 
         else:
@@ -320,3 +320,54 @@ class COCO(DynamicalSystem):
     def is_done(self):
         return self.problem.final_target_hit
         
+        
+class TestSystem(DynamicalSystem):
+    def __init__(self, 
+                 problem_fn: Callable[[float], float],
+                 grad_fn: Callable[[float], float]=None,
+                 probe_fns: Dict[str, Callable]={},  # should be functions of the form f(self, control) -> float, where `self` is the DynamicalSystem and `control` is the input to .interact()
+                 seed: int=None):
+        
+        self._set_seed(seed)
+        self.problem_fn = problem_fn
+        self.grad_fn = grad_fn
+        self.probe_fns = probe_fns
+
+        self.reset()
+        pass
+    
+    def interact(self, control: FloatController) -> float:
+        u = control.get_value()
+        obj = self.problem_fn(u)
+        grad_u = None if self.grad_fn is None else self.grad_fn(u)
+        control.step(obj=obj, grad_u=grad_u, B=0)
+        
+        self.stats['controls'][self.t] = u
+        self.stats['objectives'][self.t] = obj
+        for k, f in self.probe_fns.items():
+            self.stats[k][self.t] = f(self, control)
+        self.t += 1
+        return obj
+    
+    def reset_episode(self):
+        super().reset()  # sets seed
+        pass
+    
+    def reset(self):
+        super().reset()  # sets seed
+        
+        # stats to keep track of
+        self.t = 0
+        self.stats = {'objectives': {},
+                      'controls': {}}
+        self.stats.update({k: {} for k in self.probe_fns.keys()})
+        
+        _n = 100000
+        gt_controls = np.linspace(-10, 10, _n)
+        gt_values = [self.problem_fn(u) for u in gt_controls]
+        optimal_control = gt_controls[np.argmin(gt_values)]
+        self.stats['optimal_control'] = {'value': optimal_control}
+        self.stats['gt_controls'] = {'value': gt_controls}
+        self.stats['gt_values'] = {'value': gt_values}
+        pass
+    
