@@ -10,47 +10,43 @@ from os import cpu_count
 import time
 
 from dynamical_systems import DynamicalSystem
-from hyperparameter import FloatHyperparameter
+from controller import FloatController
 from testing.utils import window_average
 
 def main():
-    from dynamical_systems import COCO
+    from optimizer import SGD
+    from dynamical_systems import COCO, LinearRegression, MNIST
     
     use_multiprocessing = False
     num_iters = 10000
-    num_trials = 4
+    reset_every = 50000
+    num_trials = 1
     controller_args = {
-        'h': 100,
-        'initial_value': 0,
-        # 'interval': interval,
-        'rescale': True,
-        'quadratic_term': 0,
+        'h': 5,
+        'initial_value': 0.5,
+        'bounds': (0, 1),
         # 'w_clip_size': 1,
 #         'M_clip_size': 1e-9,
         # 'B_clip_size': 1,  
         # 'update_clip_size': 1,                                
         # 'cost_clip_size': 1,
-        'method': 'FKM',
-    }    
+        'method': 'REINFORCE',
+    }       
     
-    # simple tests:
-    #       1268
-    # things it breaks for:
-    #       304, 224 & 576 (lil wiggles), 2133 (this ones unfair), 1653 (sucks at wiggles), 1154 (straight line)
-    # things it works for:
-    #       515, 861
-    # things it looks interesting for:
-    #       1552 (large basin to explore), 1826 (large scale gives rly large fluctuations), 108 (zoom in on the basin)
+    make_opt = lambda model: SGD(model.parameters(), lr=FloatController(**controller_args), step_every=1)
+    probe_fns = {'disturbances': lambda system, controller: system.opt.param_groups[0]['lr'].ws[0],
+                 'ds': lambda system, controller: system.opt.param_groups[0]['lr'].update.d,
+                 }
     
-    probe_fns = {'disturbances': lambda system, controller: controller.ws[0]}
-    p_idx = np.random.randint(2160)
-    c_idx = 0
-    system = COCO(p_idx, c_idx, probe_fns=probe_fns)
-    print('Problem index is {}, coordinate index is {}, problem description is {}!'.format(p_idx, c_idx, system.problem))
+    system = LinearRegression(make_opt, dataset='generated', probe_fns=probe_fns)
+    system_name = 'Linear Regression'
     
-    stats = run(system, num_iters, num_trials, controller_args=controller_args, use_multiprocessing=use_multiprocessing)
+    # system = MNIST(make_opt, probe_fns=probe_fns)
+    # system_name = 'MNIST'
+    
+    stats = run(system, num_iters, num_trials, controller_args=None, use_multiprocessing=use_multiprocessing, reset_every=reset_every)
     results = {'GPC': stats}
-    plot_results(results, num_iters // 200, 'COCO')
+    plot_results(results, num_iters // 200, system_name)
     exit(0)
     
 def init(args):
@@ -73,15 +69,15 @@ def run_interaction_loop(system: DynamicalSystem,
     step_controller = controller_args is not None
     if step_controller:  # if we need to explicitly make the controller
         if hasattr(system, 'get_init'):  # in case the system has its own specified init and bounds
-            initial_value, interval = system.get_init()
+            initial_value, bounds = system.get_init()
             controller_args['initial_value'] = initial_value
-            controller_args['interval'] = interval
-        controller = FloatHyperparameter(**controller_args)
+            controller_args['bounds'] = bounds
+        controller = FloatController(**controller_args)
     
     pbar = range(num_iters) if use_multiprocessing else tqdm.trange(num_iters)
     for t in pbar:
         if reset_every is not None and t % reset_every == 0: 
-            system.reset()
+            system.reset_episode()
         if step_controller:
             f = system.interact(controller)
             if t % step_every == 0: controller.step(obj=f)
@@ -138,13 +134,11 @@ def plot_results(results, window_size: int, system_name: str):
     fig, ax = plt.subplots(2, 2)
     STD_MULT = 1.0
     for controller_name, stats in results.items():
-        # plot controls
-        means = window_average(stats['controls']['means'], window_size)
-        stds = window_average(stats['controls']['stds'], window_size)
-        ax[0, 0].plot(stats['controls']['ts'], means, label=controller_name)
-        ax[0, 0].fill_between(stats['controls']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
-        if 'optimal_control' in stats:
-            ax[0, 0].plot(stats['controls']['ts'], [stats['optimal_control']['means'] for _ in stats['controls']['ts']], label='optimal')
+        # plot lrs
+        means = window_average(stats['lrs']['means'], window_size)
+        stds = window_average(stats['lrs']['stds'], window_size)
+        ax[0, 0].plot(stats['lrs']['ts'], means, label=controller_name)
+        ax[0, 0].fill_between(stats['lrs']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
         # plot disturbances
         if 'disturbances' in stats:
@@ -155,40 +149,30 @@ def plot_results(results, window_size: int, system_name: str):
             ax[0, 1].plot(stats['disturbances']['ts'], means, label=controller_name)   
             ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
             
-            # pos_t = []; pos = []; pos_std = []
-            # neg_t = []; neg = []; neg_std = []
-            # for t, m, s in zip(stats['disturbances']['ts'], means, stds):
-            #     if m >= 0: pos_t.append(t); pos.append(m); pos_std.append(s)
-            #     else: neg_t.append(t); neg.append(m); neg_std.append(s)
-            # pos_t, pos, pos_std, neg_t, neg, neg_std = np.array(pos_t), np.array(pos), np.array(pos_std), np.array(neg_t), np.array(neg), np.array(neg_std)
-
-            # ax[0, 1].plot(neg_t, neg, label=controller_name, color='red')
-            # ax[0, 1].fill_between(neg_t, neg - STD_MULT * neg_std, neg + STD_MULT * neg_std, alpha=0.5, color='red')
-            # ax[0, 1].plot(pos_t, pos, label=controller_name, color='blue')
-            # ax[0, 1].fill_between(pos_t, pos - STD_MULT * pos_std, pos + STD_MULT * pos_std, alpha=0.5, color='blue')
-        
         # plot objective vs time
-        # means = window_average(stats['objectives']['means'], window_size)
-        # stds = window_average(stats['objectives']['stds'], window_size)
-        means = stats['objectives']['means']
-        stds = stats['objectives']['stds']
-        ax[1, 0].plot(stats['objectives']['ts'], means, label=controller_name)
-        ax[1, 0].fill_between(stats['objectives']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # means = window_average(stats['train_losses']['means'], window_size)
+        # stds = window_average(stats['train_losses']['stds'], window_size)
+        means = stats['train_losses']['means']
+        stds = stats['train_losses']['stds']
+        ax[1, 0].plot(stats['train_losses']['ts'], means, label=controller_name)
+        ax[1, 0].fill_between(stats['train_losses']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-        # plot objective vs control
-        us, fs = stats['gt_controls']['m'].squeeze().mean(axis=0), stats['gt_values']['m'].squeeze().mean(axis=0)
-        ax[1, 1].plot(us, fs)
+        if 'ds' in stats:
+            means = stats['ds']['means']
+            stds = stats['ds']['stds']
+            ax[1, 1].plot(stats['ds']['ts'], means, label=controller_name)
+            ax[1, 1].fill_between(stats['ds']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-    ax[0, 0].set_title('{} controls'.format(system_name))
+    ax[0, 0].set_title('{} learning rates'.format(system_name))
     ax[0, 0].legend()
     
     ax[0, 1].set_title('{} disturbances'.format(system_name))
     ax[0, 1].legend()
     
-    ax[1, 0].set_title('{} objectives'.format(system_name))
+    ax[1, 0].set_title('{} train losses'.format(system_name))
     ax[1, 0].legend()
     
-    ax[1, 1].set_title('{} objectives vs controls'.format(system_name))
+    ax[1, 1].set_title('{} d'.format(system_name))
     plt.show()
     pass
 

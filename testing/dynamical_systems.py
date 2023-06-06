@@ -27,6 +27,11 @@ class DynamicalSystem:
         pass
     
     @abstractmethod
+    def reset_episode(self, seed: int=None):
+        self._set_seed(seed)
+        pass
+    
+    @abstractmethod
     def interact(self, control: float) -> float:
         """
         returns cost
@@ -55,6 +60,9 @@ class LinearRegression(DynamicalSystem):
         
         assert dataset in ['california', 'diabetes', 'generated']
         self._set_seed(seed)
+        self.make_optimizer = make_optimizer
+        self.eval_every = eval_every
+        self.probe_fns = probe_fns
 
         if dataset == 'california':
             X, y = fetch_california_housing(data_home='data', download_if_missing=True, return_X_y=True)
@@ -66,28 +74,13 @@ class LinearRegression(DynamicalSystem):
         else:
             raise NotImplementedError(dataset)
         train_x, val_x, train_y, val_y = train_test_split(X, y)
-        self.train_x = torch.FloatTensor(train_x, device=device),  
+        self.train_x = torch.FloatTensor(train_x, device=device)
         self.train_y = torch.FloatTensor(train_y, device=device).reshape(-1, 1)
         self.val_x = torch.FloatTensor(val_x, device=device)
         self.val_y = torch.FloatTensor(val_y, device=device).reshape(-1, 1)
         
-        self.model = torch.nn.Linear(X.shape[1], 1).float()
-        self.opt = make_optimizer(self.model)
-        self.model.train().to(device)
-        
-        # stats to keep track of
-        self.t = 0
-        self.eval_every = eval_every
-        self.stats = {'train_losses': {},
-                      'val_losses': {},
-                      'lrs': {},
-                      'momenta': {}}
-        self.probe_fns = probe_fns
-        for k in self.probe_fns.keys():
-            self.stats[k] = {}
-        self.last_loss = 0           
-        if hasattr(self.opt, 'add_closure_func'):
-            self.opt.add_closure_func(lambda: self.last_loss)
+        self.reset()
+        pass
     
     def interact(self, control) -> float:
         # train step
@@ -121,12 +114,32 @@ class LinearRegression(DynamicalSystem):
         self.t += 1
         return train_loss
     
-    def reset(self):
+    def reset_episode(self):
         super().reset()  # sets seed
         for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-        self.model.train()       
+        self.model.train()    
+        pass
+    
+    def reset(self):
+        super().reset()  # sets seed
+        
+        self.model = torch.nn.Linear(self.train_x.shape[1], 1).float()
+        self.opt = self.make_optimizer(self.model)
+        self.model.train().to(device)
+        
+        # stats to keep track of
+        self.t = 0
+        self.stats = {'train_losses': {},
+                      'val_losses': {},
+                      'lrs': {},
+                      'momenta': {}}
+        self.stats.update({k: {} for k in self.probe_fns.keys()})
+        self.last_loss = 0           
+        if hasattr(self.opt, 'add_closure_func'):
+            self.opt.add_closure_func(lambda: self.last_loss)
+        pass
         
 class MNIST(DynamicalSystem):
     """
@@ -143,6 +156,10 @@ class MNIST(DynamicalSystem):
         
         assert model_type in ['MLP', 'CNN']
         self._set_seed(seed)
+        self.make_optimizer = make_optimizer
+        self.model_type = model_type
+        self.eval_every = eval_every
+        self.probe_fns = probe_fns
 
         self.train_dl = DataLoader(
             torchvision.datasets.MNIST('./data', train=True, download=True,
@@ -159,28 +176,8 @@ class MNIST(DynamicalSystem):
                            ])),
             batch_size=batch_size, shuffle=False, drop_last=True)
         self.dl = iter(self.train_dl)
-        
-        if model_type == 'MLP':
-            self.model = MLP(layer_dims=[int(28 * 28), 1000, 1000, 10]).float()
-        elif model_type == 'CNN':
-            self.model = CNN(input_shape=(28, 28), output_dim=10)
-        else:
-            raise NotImplementedError(model_type)
-        self.opt = make_optimizer(self.model)
-        self.model.train().to(device)
-        
-        # stats to keep track of
-        self.t = 0
-        self.eval_every = eval_every
-        self.stats = {'train_losses': {},
-                      'val_losses': {},
-                      'lrs': {},
-                      'momenta': {}}
-        self.probe_fns = probe_fns
-        self.stats.update({k: {} for k in self.probe_fns.keys()})
-        self.last_loss = 0           
-        if hasattr(self.opt, 'add_closure_func'):
-            self.opt.add_closure_func(lambda: self.last_loss)
+        self.reset()
+        pass
     
     def interact(self, control) -> float:
         # train step
@@ -224,12 +221,37 @@ class MNIST(DynamicalSystem):
         self.t += 1
         return train_loss
     
-    def reset(self):
+    def reset_episode(self):
         super().reset()  # sets seed
         for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-        self.model.train()       
+        self.model.train()      
+        pass
+    
+    def reset(self):
+        super().reset()  # sets seed
+        
+        if self.model_type == 'MLP':
+            self.model = MLP(layer_dims=[int(28 * 28), 1000, 1000, 10]).float()
+        elif self.model_type == 'CNN':
+            self.model = CNN(input_shape=(28, 28), output_dim=10)
+        else:
+            raise NotImplementedError(self.model_type)
+        self.opt = self.make_optimizer(self.model)
+        self.model.train().to(device)   
+        
+        # stats to keep track of
+        self.t = 0
+        self.stats = {'train_losses': {},
+                      'val_losses': {},
+                      'lrs': {},
+                      'momenta': {}}
+        self.stats.update({k: {} for k in self.probe_fns.keys()})
+        self.last_loss = 0           
+        if hasattr(self.opt, 'add_closure_func'):
+            self.opt.add_closure_func(lambda: self.last_loss)
+        pass
 
 class COCO(DynamicalSystem):
     def __init__(self, 
@@ -241,9 +263,10 @@ class COCO(DynamicalSystem):
         suite = cocoex.Suite(suite_name, "", "")
         self.problem = suite[index]
         self.u_index = u_index
-        self.initial_x = self.problem.initial_solution_proposal()  # fixed init
-        # self.initial_x = self.problem.lower_bounds + np.random.rand(self.problem.dimension) * (self.problem.upper_bounds - self.problem.lower_bounds)  # random init
+        # self.initial_x = self.problem.initial_solution_proposal()  # fixed init
+        self.initial_x = self.problem.lower_bounds + np.random.rand(self.problem.dimension) * (self.problem.upper_bounds - self.problem.lower_bounds)  # random init
         self.interval = (self.problem.lower_bounds[u_index], self.problem.upper_bounds[u_index])
+        self.problem = lambda x: ((x - 2) ** 2).mean()
           
         # stats to keep track of
         self.t = 0
@@ -255,10 +278,10 @@ class COCO(DynamicalSystem):
         # find optimal control
         self.reset()
         _n = 10000
-        _test = np.tile(self.x, _n).reshape(-1, _n)
-        _test[u_index] = np.linspace(*self.interval, _n)
-        gt_controls = _test[u_index]
-        gt_values = [self.problem(_t) for _t in _test.T]
+        _test = np.tile(self.x, _n).reshape(_n, -1)
+        _test[:, u_index] = np.linspace(*self.interval, _n)
+        gt_controls = _test[:, u_index]
+        gt_values = [self.problem(_t) for _t in _test]
         optimal_control = gt_controls[np.argmin(gt_values)]
         self.stats['optimal_control'] = {'value': optimal_control}
         self.stats['gt_controls'] = {'value': gt_controls}
@@ -286,7 +309,7 @@ class COCO(DynamicalSystem):
         x[self.u_index] = c
         obj = self.problem(x)
         
-         # probe and cache desired quantities
+        # probe and cache desired quantities
         self.stats['controls'][self.t] = c
         self.stats['objectives'][self.t] = obj
         for k, f in self.probe_fns.items():

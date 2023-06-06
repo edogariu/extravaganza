@@ -3,7 +3,7 @@ from functools import reduce
 import torch
 from torch.optim.optimizer import Optimizer
 
-from hyperparameter import FloatHyperparameter
+from controller import FloatController
 
 
 class SGD(Optimizer):
@@ -93,7 +93,7 @@ class SGD(Optimizer):
         for p in self._params:
             numel = p.numel()
             # view as to avoid deprecated pointwise semantics
-            p.data.add_(step_size, update[offset:offset + numel].view_as(p.data))
+            p.data.add_(update[offset:offset + numel].view_as(p.data), alpha=step_size)
             offset += numel
         assert offset == self._params_numel
         
@@ -110,9 +110,9 @@ class SGD(Optimizer):
         error = self.closure()
 
         group = self.param_groups[0]
-        lr = group['lr'].item() if isinstance(group['lr'], FloatHyperparameter) else group['lr']
+        lr = group['lr'].item() if isinstance(group['lr'], FloatController) else group['lr']
         weight_decay = group['weight_decay']
-        momentum = group['momentum'].item() if isinstance(group['momentum'], FloatHyperparameter) else group['momentum']
+        momentum = group['momentum'].item() if isinstance(group['momentum'], FloatController) else group['momentum']
         dampening = group['dampening']
         nesterov = group['nesterov']
 
@@ -130,7 +130,7 @@ class SGD(Optimizer):
         grad_prev = state['grad_prev']
         
         # LR UPDATE STEP
-        if isinstance(group['lr'], FloatHyperparameter) and self.t % self.step_every == 0:
+        if isinstance(group['lr'], FloatController) and self.t % self.step_every == 0:
             import numpy as np
             if np.isnan(lr): exit(0)
             
@@ -138,12 +138,12 @@ class SGD(Optimizer):
             B = -torch.dot(grad_prev, grad_prev).detach().cpu().data.numpy()
             if momentum != 0 and 'momentum_buffer' in state: 
                 B -= state['prev_momentum'] * torch.dot(state['momentum_buffer'], grad_prev).detach().cpu().data.numpy()
-            # group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
-            group['lr'].step(obj=error, B=B)  # with estimating gradients
+            group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
+            # group['lr'].step(obj=error, B=B)  # with estimating gradients
             # group['lr'].step(obj=error)  # with estimating gradients and system info!
         
         # MOMENTUM UPDATE STEP
-        if isinstance(group['momentum'], FloatHyperparameter) and self.t % self.step_every == 0 and momentum != 0 and 'momentum_buffer' in state:
+        if isinstance(group['momentum'], FloatController) and self.t % self.step_every == 0 and momentum != 0 and 'momentum_buffer' in state:
             B = -state['prev_lr'] * torch.dot(state['momentum_buffer'], grad_prev).detach().cpu().data.numpy()
             group['momentum'].step(obj=error, B=B)  # with estimating gradients
 

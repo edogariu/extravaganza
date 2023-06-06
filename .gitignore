@@ -4,7 +4,8 @@ code_graveyard*
 old*
 test.py
 exdata
-coco
+coco/
+linear_regression.ipynb
 
 
 # Byte-compiled / optimized / DLL files
