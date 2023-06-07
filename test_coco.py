@@ -17,34 +17,30 @@ def main():
     from dynamical_systems import COCO
     
     use_multiprocessing = False
-    num_iters = 10000
+    num_iters = 5000
     num_trials = 4
     controller_args = {
-        'h': 5,
-        'initial_value': 0.01,
-        'bounds': (0, 1),
+        'h': 1,
         # 'w_clip_size': 1,
-#         'M_clip_size': 1e-9,
+        'M_clip_size': 1e-9,
         # 'B_clip_size': 1,  
         # 'update_clip_size': 1,                                
         # 'cost_clip_size': 1,
-        'method': 'REINFORCE',
+        'method': 'FKM',
     }    
     
-    # simple tests:
-    #       1268
     # things it breaks for:
     #       304, 224 & 576 (lil wiggles), 2133 (this ones unfair), 1653 (sucks at wiggles), 1154 (straight line)
-    # things it works for:
-    #       515, 861
     # things it looks interesting for:
     #       1552 (large basin to explore), 1826 (large scale gives rly large fluctuations), 108 (zoom in on the basin)
+    # good nonconvex tests:
+    #       682 (two local mins, one at 0), 1129 (jaggedy), 1046 (two local mins), 2049
     
-    probe_fns = {'disturbances': lambda system, controller: controller.ws[0]}
+    probe_fns = {'disturbances': lambda system, controller: controller.M[-1] + np.dot(controller.M[:-1], list(controller.ws)[:controller.h])}
     
-    p_idx = np.random.randint(400)
-    c_idx = 1
-    system = COCO(p_idx, c_idx, probe_fns=probe_fns)
+    p_idx = 687 # np.random.randint(2160)
+    c_idx = 0
+    system = COCO(p_idx, c_idx, predict_differences=True, probe_fns=probe_fns)
     print('Problem index is {}, coordinate index is {}, problem description is {}!'.format(p_idx, c_idx, system.problem))
     
     stats = run(system, num_iters, num_trials, controller_args=controller_args, use_multiprocessing=use_multiprocessing)
@@ -83,7 +79,7 @@ def run_interaction_loop(system: DynamicalSystem,
             system.reset()
         if step_controller:
             f = system.interact(controller)
-            if t % step_every == 0: controller.step(obj=f, B=0)
+            if t % step_every == 0: controller.step(obj=f)
         else:
             system.interact(None)
     if use_multiprocessing:
@@ -163,7 +159,7 @@ def plot_results(results, window_size: int, system_name: str):
         ax[1, 0].fill_between(stats['objectives']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
         # plot objective vs control
-        us, fs = stats['gt_controls']['m'].squeeze().mean(axis=0), stats['gt_values']['m'].squeeze().mean(axis=0)
+        us, fs = stats['gt_controls']['m'].squeeze(1).mean(axis=0), stats['gt_values']['m'].squeeze(1).mean(axis=0)
         ax[1, 1].plot(us, fs)
         
     ax[0, 0].set_title('{} controls'.format(system_name))

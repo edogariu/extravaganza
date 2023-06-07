@@ -138,9 +138,13 @@ class SGD(Optimizer):
             B = -torch.dot(grad_prev, grad_prev).detach().cpu().data.numpy()
             if momentum != 0 and 'momentum_buffer' in state: 
                 B -= state['prev_momentum'] * torch.dot(state['momentum_buffer'], grad_prev).detach().cpu().data.numpy()
-            group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
+            # group['lr'].step(obj=error, grad_u=grad_lr, B=B)  # with given gradients
             # group['lr'].step(obj=error, B=B)  # with estimating gradients
-            # group['lr'].step(obj=error)  # with estimating gradients and system info!
+            group['lr'].step(obj=error)  # with estimating gradients and system info!
+            
+            # for testing FKM and sysid
+            self._grad_lr = grad_lr
+            self._B = B
         
         # MOMENTUM UPDATE STEP
         if isinstance(group['momentum'], FloatController) and self.t % self.step_every == 0 and momentum != 0 and 'momentum_buffer' in state:

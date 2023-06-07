@@ -18,31 +18,30 @@ def main():
     from dynamical_systems import COCO, LinearRegression, MNIST
     
     use_multiprocessing = False
-    num_iters = 10000
-    reset_every = 50000
+    num_iters = 2000
+    reset_every = 500
     num_trials = 1
     controller_args = {
         'h': 5,
-        'initial_value': 0.5,
+        'initial_value': 0.05,
         'bounds': (0, 1),
         # 'w_clip_size': 1,
-#         'M_clip_size': 1e-9,
+        # 'M_clip_size': 1e-9,
         # 'B_clip_size': 1,  
         # 'update_clip_size': 1,                                
         # 'cost_clip_size': 1,
-        'method': 'REINFORCE',
+        'method': 'FKM',
     }       
     
     make_opt = lambda model: SGD(model.parameters(), lr=FloatController(**controller_args), step_every=1)
-    probe_fns = {'disturbances': lambda system, controller: system.opt.param_groups[0]['lr'].ws[0],
-                 'ds': lambda system, controller: system.opt.param_groups[0]['lr'].update.d,
+    probe_fns = {'disturbances': lambda system, controller: np.dot(system.opt.param_groups[0]['lr'].M[:-1], list(system.opt.param_groups[0]['lr'].ws)[:system.opt.param_groups[0]['lr'].h]),
+                'grads': lambda system, controller: np.mean(system.opt.param_groups[0]['lr']._grad),
+                 'Bs': lambda system, controller: system.opt.param_groups[0]['lr'].B if system.opt.param_groups[0]['lr'].B is not None else 0,
+                #  'ds': lambda system, controller: system.opt.param_groups[0]['lr'].update.d,
                  }
     
-    system = LinearRegression(make_opt, dataset='generated', probe_fns=probe_fns)
-    system_name = 'Linear Regression'
-    
-    # system = MNIST(make_opt, probe_fns=probe_fns)
-    # system_name = 'MNIST'
+    # system = LinearRegression(make_opt, dataset='generated', probe_fns=probe_fns); system_name = 'Linear Regression'
+    system = MNIST(make_opt, probe_fns=probe_fns); system_name = 'MNIST'
     
     stats = run(system, num_iters, num_trials, controller_args=None, use_multiprocessing=use_multiprocessing, reset_every=reset_every)
     results = {'GPC': stats}
@@ -157,11 +156,35 @@ def plot_results(results, window_size: int, system_name: str):
         ax[1, 0].plot(stats['train_losses']['ts'], means, label=controller_name)
         ax[1, 0].fill_between(stats['train_losses']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-        if 'ds' in stats:
-            means = stats['ds']['means']
-            stds = stats['ds']['stds']
-            ax[1, 1].plot(stats['ds']['ts'], means, label=controller_name)
-            ax[1, 1].fill_between(stats['ds']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # if 'ds' in stats:
+        #     means = stats['ds']['means']
+        #     stds = stats['ds']['stds']
+        #     ax[1, 1].plot(stats['ds']['ts'], means, label=controller_name)
+        #     ax[1, 1].fill_between(stats['ds']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        # if 'true_grads' in stats:
+        #     means = stats['true_grads']['means']
+        #     stds = stats['true_grads']['stds']
+        #     ts = stats['true_grads']['ts']
+        #     ax[1, 1].plot(ts, means, label=controller_name + ' true grads')
+        #     ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        #     means = stats['grads']['means']
+        #     stds = stats['grads']['stds']
+        #     ts = stats['grads']['ts']
+        #     ax[1, 1].plot(ts, means, label=controller_name + ' estimated grads')
+        #     ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        if 'true_Bs' in stats:
+            means = stats['true_Bs']['means']
+            stds = stats['true_Bs']['stds']
+            ts = stats['true_Bs']['ts']
+            ax[1, 1].plot(ts, means, label=controller_name + ' true Bs')
+            ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+            means = stats['Bs']['means']
+            stds = stats['Bs']['stds']
+            ts = stats['Bs']['ts']
+            ax[1, 1].plot(ts, means, label=controller_name + ' estimated Bs')
+            ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
     ax[0, 0].set_title('{} learning rates'.format(system_name))
     ax[0, 0].legend()
@@ -172,7 +195,10 @@ def plot_results(results, window_size: int, system_name: str):
     ax[1, 0].set_title('{} train losses'.format(system_name))
     ax[1, 0].legend()
     
-    ax[1, 1].set_title('{} d'.format(system_name))
+    # ax[1, 1].set_title('{} d'.format(system_name))
+    ax[1, 1].set_title('{} grads'.format(system_name))
+    ax[1, 1].set_title('{} Bs'.format(system_name))
+    ax[1, 1].legend()
     plt.show()
     pass
 

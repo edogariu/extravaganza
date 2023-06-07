@@ -1,6 +1,21 @@
 import numpy as np
 from typing import Tuple
 
+class FIXED_RESCALE():
+    def __init__(self,
+                 alpha: float=1,
+                 beta: float=0):
+        self.alpha = alpha
+        self.beta = beta
+        
+        self.m = 0.
+        pass
+    
+    def step(self, val: np.ndarray, iterate=None):
+        self.m = self.beta * self.m + (1 - self.beta) * val
+        value = self.alpha * self.m
+        return value
+
 class EMA_RESCALE():
     def __init__(self,
                  alpha: float=1,
@@ -11,10 +26,11 @@ class EMA_RESCALE():
         self.eps = eps
         
         self.m = 0.
+        pass
     
     def step(self, val: np.ndarray, iterate=None):
         self.m = self.beta * self.m + (1 - self.beta) * val
-        value = val / (np.abs(self.m) + self.eps)
+        value = self.alpha * val / (np.abs(self.m) + self.eps)
         return value
 
 class ADAM():
@@ -88,6 +104,7 @@ class D_ADAM():
         self.d = d0
         self.m = 0.; self.v = 0.; self.s = 0.; self.r = 0.
         self.t = 1
+        pass
 
     def step(self, val: np.ndarray, iterate=None):
         bias_correction = (1 - self.beta2 ** self.t) ** 0.5 / (1 - self.beta1 ** self.t) if self.use_bias_correction else 1
@@ -95,11 +112,11 @@ class D_ADAM():
         sqrt_beta2 = self.beta2 ** 0.5
         denom = self.v ** 0.5 + self.eps
         
-        self.m = self.beta1 * self.m + (1 - self.beta1) * val * alpha_t  # NOTE this `* alpha_t` is not in vanilla ADAM
+        self.m = self.beta1 * self.m + (1 - self.beta1) * val * alpha_t  # NOTE the `* alpha_t` is not in vanilla ADAM
         self.v = self.beta2 * self.v + (1 - self.beta2) * val ** 2
         self.s = sqrt_beta2 * self.s + (1 - sqrt_beta2) * val * alpha_t
         self.r = sqrt_beta2 * self.r + (1 - sqrt_beta2) * np.dot(val, self.s / denom) * alpha_t
-        d_hat = self.r / ((1 - sqrt_beta2) * np.abs(self.s).sum())
+        d_hat = self.r / ((1 - sqrt_beta2) * np.abs(self.s).sum() + self.eps)
         self.d = max(self.d, min(d_hat, self.d * self.growth_rate))
         
         value = self.m / denom

@@ -15,21 +15,24 @@ def d_sigmoid(t):
     s = sigmoid(t)
     return s * (1 - s)
 
-def rescale(t, bounds, use_sigmoid):
+def rescale(t, bounds, do_rescale, use_sigmoid):
     """
     rescales from `[0, 1] -> [tmin, tmax]`
     """
+    if not do_rescale: return t
     tmin, tmax = bounds
     if use_sigmoid: t = sigmoid(t)
     return tmin + (tmax - tmin) * t
 
-def d_rescale(t, bounds, use_sigmoid):
+def d_rescale(t, bounds, do_rescale, use_sigmoid):
+    if not do_rescale: return 1
     tmin, tmax = bounds
     d = tmax - tmin
     if use_sigmoid: d *= d_sigmoid(t)
     return d
 
-def inv_rescale(s, bounds, use_sigmoid):
+def inv_rescale(s, bounds, do_rescale, use_sigmoid):
+    if not do_rescale: return s
     tmin, tmax = bounds
     t = (s - tmin) / (tmax - tmin)
     if use_sigmoid: t = inv_sigmoid(t)

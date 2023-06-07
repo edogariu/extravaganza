@@ -3,9 +3,10 @@ from collections import deque
 import numpy as np
 
 from wrappers import FloatWrapper
-from rescalers import EMA_RESCALE, ADAM, D_ADAM, DoWG
+from rescalers import EMA_RESCALE, ADAM, D_ADAM, DoWG, FIXED_RESCALE
 from utils import rescale, d_rescale, inv_rescale
 
+RESCALE = True
 USE_SIGMOID = True
 
 class FloatController(FloatWrapper):
@@ -13,6 +14,7 @@ class FloatController(FloatWrapper):
                  h: int, 
                  initial_value: float, 
                  bounds: Tuple[float, float]=(0, 1),
+                 u_clip_size: float=float('inf'),
                  w_clip_size: float=float('inf'), 
                  M_clip_size: float=float('inf'), 
                  B_clip_size: float=float('inf'),
@@ -39,6 +41,7 @@ class FloatController(FloatWrapper):
         assert method in ['FKM', 'REINFORCE']
         
         self.h = h
+        self.u_clip_size = u_clip_size
         self.w_clip_size = w_clip_size
         self.M_clip_size = M_clip_size
         self.B_clip_size = B_clip_size
@@ -48,16 +51,27 @@ class FloatController(FloatWrapper):
         
         self.bounds = bounds
         self.umin, self.umax = bounds
-        super().__init__(inv_rescale(initial_value, self.bounds, USE_SIGMOID))
+        super().__init__(inv_rescale(initial_value, self.bounds, RESCALE, USE_SIGMOID))
         
         # dynamic parameters of the optimization
         # for meta lr updates
-        # self.update = ADAM(alpha=0.001, betas=(0.9, 0.999))
-        self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.02, use_bias_correction=False)
-        # self.update = DoWG(alpha=1e4)
-        # self.obj = ADAM(betas=(0.9, 0.999))
-        # self.obj = EMA_RESCALE(beta=0)
+        self._grad = deque([0], maxlen=10)  # for plotting gradients
         
+        self.updates = deque(maxlen=self.h)
+        # self.update = FIXED_RESCALE(alpha=0.001, beta=0.9)
+        self.update = ADAM(alpha=0.01, betas=(0.9, 0.999))
+        # self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.02, use_bias_correction=False)
+        # self.update = DoWG(alpha=1e4)
+        # self.obj = EMA_RESCALE(beta=0.9)
+        # self.obj = ADAM(betas=(0.99, 0.999))
+        # self.w = EMA_RESCALE(beta=0.999)
+        self.w = ADAM(betas=(0.9, 0.999))
+        
+        self.delta = 0.01
+        self.sigma_max = 0.1
+        self.wait = 1
+        self.B_momentum = 0.999
+                
         self.M = np.zeros(self.h + 1)  # self.M[i] = M_i^t, but self.M[-1] is the bias
         self.M[-1] = self.value[0]
         self.prev_obj = None  # previous cost f(x_t)
@@ -77,7 +91,7 @@ class FloatController(FloatWrapper):
             raise NotImplementedError()
     
     def get_value(self) -> float:  # rescale u_t if needed
-        return rescale(super().get_value(), self.bounds, USE_SIGMOID)
+        return rescale(super().get_value(), self.bounds, RESCALE, USE_SIGMOID)
     
     def step(self, obj: float, B: float=None, grad_u: float=None):
         """
@@ -105,30 +119,34 @@ class FloatController(FloatWrapper):
             if obj == 0: return  
             self.prev_obj = obj
             self.scale = abs(obj)
-            self.sigma = min(1e-5, self.scale)
+            self.sigma = min(self.sigma_max, self.scale)
             if B is None:
                 self.r = np.random.randn() * self.sigma
                 self.B = self.r * obj
             self.t += 1
             return        
         
-        # observe
+        # observe 
+        diff = obj - self.prev_obj
         if B is None:
-            b_lr = 1 / self.t
-            self.B = (1 - b_lr) * self.B + b_lr * obj * self.r / self.sigma
+            # self.B_momentum = 1 - 1 / self.t
+            # self.B = self.B_momentum * self.B + (1 - self.B_momentum) * obj * self.r / self.sigma
+            self.B = self.B_momentum * self.B + (1 - self.B_momentum) * diff * self.r / self.sigma ** 2
             self.B = np.clip(self.B, -self.B_clip_size, self.B_clip_size)
             B = self.B
-        # pred = self.prev_obj + self.prev_control * B  # \hat{s_t} = f(x_{t-1}) + B
-        pred = self.prev_control
+        pred = (1 - self.delta) * self.prev_obj + self.get_value() * B  # \hat{s_t} = f(x_{t-1}) + B
         w = obj - pred  # w_t = s_t - \hat{s_t}
         w = np.clip(w, -self.w_clip_size, self.w_clip_size)
         self.prev_obj = obj
+        
+        w = self.w.step(w)
                 
         # compute scale
         # scale_lr = 0.01# 1 / (self.t ** 0.5)
         # self.scale = (1 - scale_lr) * self.scale + scale_lr * abs(obj)
         self.scale = max(self.scale, abs(obj))
-        self.sigma = min(0.1, self.scale / (self.t ** 0.25)) if (grad_u is None or self.B is not None) else 0
+        self.sigma = min(self.sigma_max, self.scale / (self.t ** 0.25)) if (grad_u is None or self.B is not None) else 0
+        # self.sigma = self.sigma_max / self.t ** 0.25
                 
         # calc gradients and update
         grad = np.zeros(self.h + 1)
@@ -137,31 +155,35 @@ class FloatController(FloatWrapper):
             grad[-1] = grad_u
         else:
             if self.method == 'FKM':
-                grad = self.ns * obj / self.sigma
+                # grad = self.ns * obj / self.sigma
+                grad = self.ns * diff / self.sigma ** 2
             elif self.method == 'REINFORCE':
-                grad[:-1] = np.array(self.ns)[1:] * np.array(self.ws)[:self.h] * obj / self.sigma
-                grad[-1] = self.ns[0] * obj / self.sigma
-                
-        grad *= d_rescale(float(self.value[0]), self.bounds, USE_SIGMOID)
-        update = self.update.step(grad, iterate=self.M)
+                # grad[:-1] = np.array(self.ns)[1:] * np.array(self.ws)[:self.h] * obj / self.sigma
+                # grad[-1] = self.ns[0] * obj / self.sigma
+                grad[:-1] = np.array(self.ns)[1:] * np.array(self.ws)[:self.h] * diff / self.sigma ** 2
+                grad[-1] = self.ns[0] * diff / self.sigma ** 2
         
-        if self.t < 50:  # only observe in the beginning
+        self._grad.append(grad[-1])
+        grad[-1] = np.mean(self._grad)
+        
+        grad *= d_rescale(float(self.value[0]), self.bounds, RESCALE, USE_SIGMOID)
+        update = self.update.step(grad, iterate=self.M)
+        update = np.clip(update, -self.update_clip_size, self.update_clip_size)
+        self.updates.appendleft(update)
+        
+        if self.t < self.wait:  # wait and observe in the beginning
             self.t += 1
             self.ws.appendleft(w)
             return
         
-        update = np.clip(update, -self.update_clip_size, self.update_clip_size)
+        if grad_u is None: update = self.updates[-1]  # update with gradient from h steps ago when estimating
         self.M -= update
-                
-        # clip some more
-        # w = np.clip(w, -1, 1)
-        # w = self.w.step(np.clip(w, -self.w_clip_size, self.w_clip_size))
-        # self.M[:-1] = np.clip(self.M[:-1], -1 / self.h, 1 / self.h)
-        # self.M[-1] = np.clip(self.M[-1], inv_rescale(self.umin, self.bounds), inv_rescale(self.umax, self.bounds))
+        self.M[:-1] = np.clip(self.M[:-1], -self.M_clip_size, self.M_clip_size)        
         
-        print('u_t={:.4f} \tG_t={:.4f} \t||grad||={:.4f} \tsigma_t={:.4f}\tB={:.4f}'.format(self.get_value(), self.scale, np.linalg.norm(grad), self.sigma, B), 
-        '\n\tdelta_t={} '.format(update), 
-        '\n\tM={} \n\tw={}'.format(self.M, np.array(self.ws)[:self.h]))
+        # print('u_t={:.4f} \tG_t={:.4f} \t||grad||={:.4f} \tsigma_t={:.4f}\tB={:.4f}'.format(self.get_value(), self.scale, np.linalg.norm(grad), self.sigma, B), 
+        # # '\n\tdelta_t={} '.format(update), 
+        # # '\n\tM={} \n\tw={}'.format(self.M, np.array(self.ws)[:self.h])
+        # )
 
         # play u_{t + 1}
         self.t += 1
@@ -190,4 +212,4 @@ class FloatController(FloatWrapper):
         if self.B is not None:  # add what is needed for system identification
             self.r = np.random.randn() * self.sigma
             u += self.r
-        return u
+        return np.clip(u, -self.u_clip_size, self.u_clip_size)

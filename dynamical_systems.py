@@ -2,6 +2,7 @@ from abc import abstractmethod
 from typing import Dict, Callable, Tuple
 
 import random
+from scipy.optimize import fmin
 from sklearn.datasets import fetch_california_housing, load_diabetes, make_regression
 from sklearn.model_selection import train_test_split
 import cocoex
@@ -101,6 +102,10 @@ class LinearRegression(DynamicalSystem):
             self.stats['momenta'][self.t] = momentum if not hasattr(momentum, 'item') else momentum.item()
         except KeyError:
             pass
+        if hasattr(self.opt, '_grad_lr'):
+            self.stats['true_grads'][self.t] = self.opt._grad_lr
+        if hasattr(self.opt, '_B'):
+            self.stats['true_Bs'][self.t] = self.opt._B    
         for k, f in self.probe_fns.items():
             self.stats[k][self.t] = f(self, control)
             
@@ -135,7 +140,10 @@ class LinearRegression(DynamicalSystem):
         self.stats = {'train_losses': {},
                       'val_losses': {},
                       'lrs': {},
-                      'momenta': {}}
+                      'momenta': {},
+                      'true_grads': {},
+                      'true_Bs': {}}
+        assert not any([k in self.stats for k in self.probe_fns.keys()])
         self.stats.update({k: {} for k in self.probe_fns.keys()})
         self.last_loss = 0           
         if hasattr(self.opt, 'add_closure_func'):
@@ -204,6 +212,10 @@ class MNIST(DynamicalSystem):
             self.stats['momenta'][self.t] = momentum if not hasattr(momentum, 'item') else momentum.item()
         except KeyError:
             pass
+        if hasattr(self.opt, '_grad_lr'):
+            self.stats['true_grads'][self.t] = self.opt._grad_lr
+        if hasattr(self.opt, '_B'):
+            self.stats['true_Bs'][self.t] = self.opt._B 
         for k, f in self.probe_fns.items():
             self.stats[k][self.t] = f(self, control)
             
@@ -247,7 +259,10 @@ class MNIST(DynamicalSystem):
         self.stats = {'train_losses': {},
                       'val_losses': {},
                       'lrs': {},
-                      'momenta': {}}
+                      'momenta': {},
+                      'true_grads': {},
+                      'true_Bs': {}}
+        assert not any([k in self.stats for k in self.probe_fns.keys()])
         self.stats.update({k: {} for k in self.probe_fns.keys()})
         self.last_loss = 0           
         if hasattr(self.opt, 'add_closure_func'):
@@ -258,14 +273,16 @@ class COCO(DynamicalSystem):
     def __init__(self, 
                  index: int,  # index of the problem in the suite to use
                  u_index: int,  # index of which coordinate of the problem we will optimize
+                 predict_differences: bool,
                  probe_fns: Dict[str, Callable]={},  # should be functions of the form f(self, control) -> float, where `self` is the DynamicalSystem and `control` is the input to .interact()
                 ):
         suite_name = "bbob"
         suite = cocoex.Suite(suite_name, "", "")
         self.problem = suite[index]
         self.u_index = u_index
-        # self.initial_x = self.problem.initial_solution_proposal()  # fixed init
-        self.initial_x = self.problem.lower_bounds + np.random.rand(self.problem.dimension) * (self.problem.upper_bounds - self.problem.lower_bounds)  # random init
+        self.predict_differences = predict_differences
+        self.initial_x = self.problem.initial_solution_proposal()  # fixed init
+        # self.initial_x = self.problem.lower_bounds + np.random.rand(self.problem.dimension) * (self.problem.upper_bounds - self.problem.lower_bounds)  # random init
         self.interval = (self.problem.lower_bounds[u_index], self.problem.upper_bounds[u_index])
         self.probe_fns = probe_fns
         
@@ -281,6 +298,7 @@ class COCO(DynamicalSystem):
         self.t = 0
         self.stats = {'controls': {},
                       'objectives': {}}
+        assert not any([k in self.stats for k in self.probe_fns.keys()])
         self.stats.update({k: {} for k in self.probe_fns.keys()})
         
         # find optimal control
@@ -293,57 +311,82 @@ class COCO(DynamicalSystem):
         self.stats['optimal_control'] = {'value': optimal_control}
         self.stats['gt_controls'] = {'value': gt_controls}
         self.stats['gt_values'] = {'value': gt_values}
+        
+        # def func(x):
+        #     vec = self.initial_x.copy()
+        #     vec[self.u_index] = x
+        #     return self.problem(vec)
+        # self.stats['fmin_controls'] = {t: v[0] for t, v in enumerate(fmin(func, self.initial_x[self.u_index], retall=True, disp=False)[:15])}
         pass
     
     def get_init(self) -> Tuple[float, Tuple[float, float]]:  # returns initial value and desired interval
-        return self.x[self.u_index], self.interval
+        return (self.initial_x[self.u_index], self.interval) if not self.predict_differences else (0, self.interval)
         
     def interact(self, control: FloatController):
         if hasattr(control, 'item'): 
             c = control.item() 
         else:
             c = control
-        c = np.clip(c, *self.interval) # NOTE THIS CLIPS THE CONTROL, WE MIGHT NOT WANT THIS
-        assert c >= self.interval[0] and c <= self.interval[1], 'control must be in {}'.format(self.interval)
+            
         x = self.x.copy()
-        x[self.u_index] = c
+        x[self.u_index] = c if not self.predict_differences else x[self.u_index] + c
         obj = self.problem(x)
         
         # probe and cache desired quantities
-        self.stats['controls'][self.t] = c
+        self.stats['controls'][self.t] = x[self.u_index]
         self.stats['objectives'][self.t] = obj
         for k, f in self.probe_fns.items():
             self.stats[k][self.t] = f(self, control)
         self.t += 1
         return obj
     
-    def is_done(self):
-        return self.problem.final_target_hit
         
-        
-class TestSystem(DynamicalSystem):
+class SimpleSystem(DynamicalSystem):
     def __init__(self, 
-                 problem_fn: Callable[[float], float],
-                 grad_fn: Callable[[float], float]=None,
+                 problem_fn,
+                 grad_fn,
+                 controller_args,
+                 predict_differences: bool,
+                 use_grad: bool,
+                 use_B: bool,
                  probe_fns: Dict[str, Callable]={},  # should be functions of the form f(self, control) -> float, where `self` is the DynamicalSystem and `control` is the input to .interact()
                  seed: int=None):
         
         self._set_seed(seed)
+        self.predict_differences = predict_differences
+        self.use_grad = use_grad
+        self.use_B = use_B
+        self.probe_fns = probe_fns
+                
         self.problem_fn = problem_fn
         self.grad_fn = grad_fn
-        self.probe_fns = probe_fns
-
+        self.B_fn = lambda x, prev_x: (self.problem_fn(x) - self.problem_fn(prev_x)) / (x - prev_x) if self.predict_differences and self.x != prev_x else 0
+            
+        self.initial_x = 0
+        
+        controller_args['initial_value'] = 0 if self.predict_differences else self.initial_x
+        controller_args['bounds'] = (-0.1, 0.1) if self.predict_differences else (-10, 10)
+        self.controller_args = controller_args
         self.reset()
         pass
     
     def interact(self, control: FloatController) -> float:
-        u = control.get_value()
-        obj = self.problem_fn(u)
-        grad_u = None if self.grad_fn is None else self.grad_fn(u)
-        control.step(obj=obj, grad_u=grad_u, B=0)
+        u = self.controller.item() 
+        if self.predict_differences:
+            prev_x = self.x
+            self.x += u
+        else:
+            prev_x = self.x = u
         
-        self.stats['controls'][self.t] = u
+        obj = self.problem_fn(self.x)
+        grad_u = self.grad_fn(self.x)
+        B = self.B_fn(self.x, prev_x)
+        self.controller.step(obj=obj, grad_u=grad_u if self.use_grad else None, B=B if self.use_B else None)
+        
+        self.stats['controls'][self.t] = self.x
         self.stats['objectives'][self.t] = obj
+        self.stats['true_grads'][self.t] = grad_u
+        self.stats['true_Bs'][self.t] = B
         for k, f in self.probe_fns.items():
             self.stats[k][self.t] = f(self, control)
         self.t += 1
@@ -356,17 +399,22 @@ class TestSystem(DynamicalSystem):
     def reset(self):
         super().reset()  # sets seed
         
+        self.x = self.initial_x
+        self.controller = FloatController(**self.controller_args)
+        
         # stats to keep track of
         self.t = 0
         self.stats = {'objectives': {},
-                      'controls': {}}
+                      'controls': {},
+                      'true_grads': {},
+                      'true_Bs': {}}
+        assert not any([k in self.stats for k in self.probe_fns.keys()])
         self.stats.update({k: {} for k in self.probe_fns.keys()})
         
         _n = 100000
         gt_controls = np.linspace(-10, 10, _n)
         gt_values = [self.problem_fn(u) for u in gt_controls]
-        optimal_control = gt_controls[np.argmin(gt_values)]
-        self.stats['optimal_control'] = {'value': optimal_control}
+        self.stats['optimal_control'] = {'value': gt_controls[np.argmin(gt_values)]}
         self.stats['gt_controls'] = {'value': gt_controls}
         self.stats['gt_values'] = {'value': gt_values}
         pass

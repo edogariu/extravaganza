@@ -11,44 +11,48 @@ import time
 
 from dynamical_systems import DynamicalSystem
 from controller import FloatController
-from testing.utils import window_average
+from utils import window_average
 
-a = 4
-c = 1
+optimal_value = 4
+scale = 100
 
-# def f(x):
-#     return c * np.tanh(x - a) * np.tanh(x) + np.random.randn() * 0.01 * c
-# def grad_f(x):
-#     return c * 2 * np.tanh(x - a) * (1 - np.tanh(x - a) * np.tanh(x - a))
-
+# convex quadratic
 def f(x):
-    return c * (x - a) * (x - a) + np.random.randn() * 0.01 * c
-def grad_f(x):
-    return c * 2 * (x - a)
+    return scale * (x - optimal_value) * (x - optimal_value)
+def d_f(x):
+    return scale * 2 * (x - optimal_value)
+
+# # weird silly function
+# optimal_value += 2 / 9
+# def f(x):
+#     return scale * (x - optimal_value) * np.sin(1 / (x - optimal_value))
+# def d_f(x):
+#     return scale * np.sin(1 / (x - optimal_value)) - scale * np.cos(1 / (x - optimal_value)) / (x - optimal_value)
 
 
 def main():
-    from dynamical_systems import TestSystem
+    from dynamical_systems import SimpleSystem
     
     use_multiprocessing = False
-    num_iters = 5000
-    num_trials = 4
+    num_iters = 10000
+    num_trials = 1
     controller_args = {
-        'h': 5,
-        'initial_value': 0.5,
-        'bounds': (-5, 5),
+        'h': 1,
+        # 'u_clip_size': 1,
         # 'w_clip_size': 1,
-    #         'M_clip_size': 1e-9,
+            'M_clip_size': 1e-9,
         # 'B_clip_size': 1,  
         # 'update_clip_size': 1,                                
         # 'cost_clip_size': 1,
         'method': 'FKM',
     }    
     
-    probe_fns = {'disturbances': lambda system, controller: controller.ws[0]}
-    system = TestSystem(problem_fn=f, grad_fn=grad_f, probe_fns=probe_fns)
-    # system = TestSystem(problem_fn=f, grad_fn=None, probe_fns=probe_fns)
-    stats = run(system, num_iters, num_trials, controller_args=controller_args, use_multiprocessing=use_multiprocessing)
+    # probe_fns = {'disturbances': lambda system, controller: system.controller.ws[0]}
+    probe_fns = {'disturbances': lambda system, controller: system.controller.ws[0] * system.controller.M[0],
+                 'grads': lambda system, controller: np.mean(system.controller._grad),
+                 'Bs': lambda system, controller: system.controller.B if system.controller.B is not None else 0}
+    system = SimpleSystem(f, d_f, controller_args, predict_differences=True, use_grad=False, use_B=False, probe_fns=probe_fns)
+    stats = run(system, num_iters, num_trials, controller_args=None, use_multiprocessing=use_multiprocessing)
     results = {'GPC': stats}
     plot_results(results, num_iters // 200, 'test')
     exit(0)
@@ -144,7 +148,7 @@ def plot_results(results, window_size: int, system_name: str):
         ax[0, 0].plot(stats['controls']['ts'], means, label=controller_name)
         ax[0, 0].fill_between(stats['controls']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         if 'optimal_control' in stats:
-            ax[0, 0].plot(stats['controls']['ts'], [a for _ in stats['controls']['ts']], label='optimal')
+            ax[0, 0].plot(stats['controls']['ts'], [stats['optimal_control']['means'] for _ in stats['controls']['ts']], label='optimal')
         
         # plot disturbances
         if 'disturbances' in stats:
@@ -155,17 +159,44 @@ def plot_results(results, window_size: int, system_name: str):
             ax[0, 1].plot(stats['disturbances']['ts'], means, label=controller_name)   
             ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
             
-        # plot objective vs time
-        # means = window_average(stats['objectives']['means'], window_size)
-        # stds = window_average(stats['objectives']['stds'], window_size)
-        means = stats['objectives']['means']
-        stds = stats['objectives']['stds']
-        ax[1, 0].plot(stats['objectives']['ts'], means, label=controller_name)
-        ax[1, 0].fill_between(stats['objectives']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # # plot objective vs time
+        # # means = window_average(stats['objectives']['means'], window_size)
+        # # stds = window_average(stats['objectives']['stds'], window_size)
+        # means = stats['objectives']['means']
+        # stds = stats['objectives']['stds']
+        # ax[1, 0].plot(stats['objectives']['ts'], means, label=controller_name)
+        # ax[1, 0].fill_between(stats['objectives']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         
-        # plot objective vs control
-        us, fs = stats['gt_controls']['m'].squeeze()[0], stats['gt_values']['m'].squeeze()[0]
-        ax[1, 1].plot(us, fs)
+        # # plot objective vs control
+        # us, fs = stats['gt_controls']['m'].squeeze(), stats['gt_values']['m'].squeeze()
+        # ax[1, 1].plot(us, fs)
+        
+        # plot grads and Bs over time
+        means = stats['grads']['means']
+        stds = stats['grads']['stds']
+        ts = stats['grads']['ts']
+        ax[1, 0].plot(ts, means, label=controller_name + ' grads')   
+        ax[1, 0].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        means = window_average(stats['grads']['means'], window_size * 5)
+        ax[1, 0].plot(ts, means, label=controller_name + ' avg grads')   
+        
+        means = stats['true_grads']['means']
+        stds = stats['true_grads']['stds']
+        ts = stats['true_grads']['ts']
+        ax[1, 0].plot(ts, means, label=controller_name + ' true grads')   
+        ax[1, 0].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
+        means = stats['Bs']['means']
+        stds = stats['Bs']['stds']
+        ts = stats['Bs']['ts']
+        ax[1, 1].plot(ts, means, label=controller_name + ' Bs')   
+        ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        means = stats['true_Bs']['means']
+        stds = stats['true_Bs']['stds']
+        ts = stats['true_Bs']['ts']
+        ax[1, 1].plot(ts, means, label=controller_name + ' true Bs')   
+        ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        
         
     ax[0, 0].set_title('{} controls'.format(system_name))
     ax[0, 0].legend()
@@ -173,10 +204,13 @@ def plot_results(results, window_size: int, system_name: str):
     ax[0, 1].set_title('{} disturbances'.format(system_name))
     ax[0, 1].legend()
     
-    ax[1, 0].set_title('{} objectives'.format(system_name))
+    # ax[1, 0].set_title('{} objectives'.format(system_name))
+    ax[1, 0].set_title('{} gradients w.r.t. u'.format(system_name))
     ax[1, 0].legend()
     
-    ax[1, 1].set_title('{} objectives vs controls'.format(system_name))
+    # ax[1, 1].set_title('{} objectives vs controls'.format(system_name))
+    ax[1, 1].set_title('{} B'.format(system_name))
+    ax[1, 1].legend()
     plt.show()
     pass
 
