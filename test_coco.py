@@ -17,30 +17,29 @@ def main():
     from dynamical_systems import COCO
     
     use_multiprocessing = False
-    num_iters = 5000
-    num_trials = 4
+    num_iters = 10000
+    num_trials = 1
     controller_args = {
-        'h': 1,
-        # 'w_clip_size': 1,
-        'M_clip_size': 1e-9,
-        # 'B_clip_size': 1,  
-        # 'update_clip_size': 1,                                
-        # 'cost_clip_size': 1,
-        'method': 'FKM',
-    }    
+        'h': 10,
+        'w_clip_size': 0.1,
+        # 'M_clip_size': 1e-20,
+        'method': 'REINFORCE',
+    }
     
     # things it breaks for:
     #       304, 224 & 576 (lil wiggles), 2133 (this ones unfair), 1653 (sucks at wiggles), 1154 (straight line)
     # things it looks interesting for:
     #       1552 (large basin to explore), 1826 (large scale gives rly large fluctuations), 108 (zoom in on the basin)
     # good nonconvex tests:
-    #       682 (two local mins, one at 0), 1129 (jaggedy), 1046 (two local mins), 2049
+    #       682 and 683 (two local mins, one at 0), 1129 (jaggedy), 1046 (two local mins), 2049
     
-    probe_fns = {'disturbances': lambda system, controller: controller.M[-1] + np.dot(controller.M[:-1], list(controller.ws)[:controller.h])}
+    probe_fns = {'disturbances': lambda system, controller: controller.ws[0], 
+                 'Ms': lambda system, controller: np.dot(controller.M[:-1], list(controller.ws)[:controller.h]),
+                 'M0s': lambda system, controller: controller.M[-1]}
     
-    p_idx = 687 # np.random.randint(2160)
+    p_idx = 683 # np.random.randint(2160)
     c_idx = 0
-    system = COCO(p_idx, c_idx, predict_differences=True, probe_fns=probe_fns)
+    system = COCO(p_idx, c_idx, predict_differences=False, probe_fns=probe_fns)
     print('Problem index is {}, coordinate index is {}, problem description is {}!'.format(p_idx, c_idx, system.problem))
     
     stats = run(system, num_iters, num_trials, controller_args=controller_args, use_multiprocessing=use_multiprocessing)
@@ -134,44 +133,47 @@ def plot_results(results, window_size: int, system_name: str):
     STD_MULT = 1.0
     for controller_name, stats in results.items():
         # plot controls
-        means = window_average(stats['controls']['means'], window_size)
-        stds = window_average(stats['controls']['stds'], window_size)
+        means = stats['controls']['means']
+        stds = stats['controls']['stds']
         ax[0, 0].plot(stats['controls']['ts'], means, label=controller_name)
         ax[0, 0].fill_between(stats['controls']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
         if 'optimal_control' in stats:
             ax[0, 0].plot(stats['controls']['ts'], [stats['optimal_control']['means'] for _ in stats['controls']['ts']], label='optimal')
         
-        # plot disturbances
-        if 'disturbances' in stats:
-            # means = window_average(stats['disturbances']['means'], window_size)
-            # stds = window_average(stats['disturbances']['stds'], window_size)
-            means = stats['disturbances']['means']
-            stds = stats['disturbances']['stds']
-            ax[0, 1].plot(stats['disturbances']['ts'], means, label=controller_name)   
-            ax[0, 1].fill_between(stats['disturbances']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        # plot prediction params
+        means = stats['Ms']['means']
+        stds = stats['Ms']['stds']
+        ts = stats['Ms']['ts']
+        ax[0, 1].plot(ts, means, label=controller_name + ' M[1:h] \cdot w')   
+        ax[0, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+        means = stats['M0s']['means']
+        stds = stats['M0s']['stds']
+        ts = stats['M0s']['ts']
+        ax[0, 1].plot(ts, means, label=controller_name + ' M0')   
+        ax[0, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
             
-        # plot objective vs time
-        # means = window_average(stats['objectives']['means'], window_size)
-        # stds = window_average(stats['objectives']['stds'], window_size)
-        means = stats['objectives']['means']
-        stds = stats['objectives']['stds']
-        ax[1, 0].plot(stats['objectives']['ts'], means, label=controller_name)
-        ax[1, 0].fill_between(stats['objectives']['ts'], means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
-        
         # plot objective vs control
         us, fs = stats['gt_controls']['m'].squeeze(1).mean(axis=0), stats['gt_values']['m'].squeeze(1).mean(axis=0)
-        ax[1, 1].plot(us, fs)
+        ax[1, 0].plot(us, fs)
+
+        # plot disturbances
+        means = stats['disturbances']['means']
+        stds = stats['disturbances']['stds']
+        ts = stats['disturbances']['ts']
+        ax[1, 1].plot(ts, means, label=controller_name)
+        ax[1, 1].fill_between(ts, means - STD_MULT * stds, means + STD_MULT * stds, alpha=0.5)
+
         
     ax[0, 0].set_title('{} controls'.format(system_name))
     ax[0, 0].legend()
     
-    ax[0, 1].set_title('{} disturbances'.format(system_name))
+    ax[0, 1].set_title('{} preds'.format(system_name))
     ax[0, 1].legend()
     
-    ax[1, 0].set_title('{} objectives'.format(system_name))
-    ax[1, 0].legend()
+    ax[1, 0].set_title('{} objectives vs controls'.format(system_name))
     
-    ax[1, 1].set_title('{} objectives vs controls'.format(system_name))
+    ax[1, 1].set_title('{} disturbances'.format(system_name))
+    ax[1, 1].legend()
     plt.show()
     pass
 

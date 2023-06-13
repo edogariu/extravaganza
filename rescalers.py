@@ -1,7 +1,27 @@
-import numpy as np
+from abc import abstractmethod
 from typing import Tuple
 
-class FIXED_RESCALE():
+import numpy as np
+from numpy import ndarray
+
+class Rescaler:
+    @abstractmethod
+    def step(self, 
+             val: ndarray,
+             iterate: ndarray=None) -> ndarray:
+        """
+        steps the rescaler, returning a rescaled version of `val`
+
+        Parameters
+        ----------
+        val : ndarray
+            the array to be dynamically rescaled
+        iterate : ndarray, optional
+            any iterates helpful for the computation, by default None
+        """
+        pass
+
+class FIXED_RESCALE(Rescaler):
     def __init__(self,
                  alpha: float=1,
                  beta: float=0):
@@ -11,12 +31,14 @@ class FIXED_RESCALE():
         self.m = 0.
         pass
     
-    def step(self, val: np.ndarray, iterate=None):
+    def step(self, 
+             val: ndarray, 
+             iterate: ndarray=None):
         self.m = self.beta * self.m + (1 - self.beta) * val
         value = self.alpha * self.m
         return value
 
-class EMA_RESCALE():
+class EMA_RESCALE(Rescaler):
     def __init__(self,
                  alpha: float=1,
                  beta: float=0.9,
@@ -28,12 +50,14 @@ class EMA_RESCALE():
         self.m = 0.
         pass
     
-    def step(self, val: np.ndarray, iterate=None):
+    def step(self, 
+             val: ndarray, 
+             iterate: ndarray=None):
         self.m = self.beta * self.m + (1 - self.beta) * val
         value = self.alpha * val / (np.abs(self.m) + self.eps)
         return value
 
-class ADAM():
+class ADAM(Rescaler):
     def __init__(self, 
                  alpha: float=1, 
                  betas: Tuple[float, float]=(0.9, 0.999), 
@@ -62,7 +86,9 @@ class ADAM():
         self.t = 1
         pass
     
-    def step(self, val: np.ndarray, iterate=None):
+    def step(self, 
+             val: ndarray, 
+             iterate: ndarray=None):
         bias_correction = (1 - self.beta2 ** self.t) ** 0.5 / (1 - self.beta1 ** self.t) if self.use_bias_correction else 1
         alpha_t = self.alpha * bias_correction
         
@@ -74,7 +100,7 @@ class ADAM():
         return value
     
     
-class D_ADAM():
+class D_ADAM(Rescaler):
     def __init__(self, 
                  alpha: float=1, 
                  betas: Tuple[float, float]=(0.9, 0.999), 
@@ -106,7 +132,9 @@ class D_ADAM():
         self.t = 1
         pass
 
-    def step(self, val: np.ndarray, iterate=None):
+    def step(self, 
+             val: ndarray, 
+             iterate: ndarray=None):
         bias_correction = (1 - self.beta2 ** self.t) ** 0.5 / (1 - self.beta1 ** self.t) if self.use_bias_correction else 1
         alpha_t = self.d * self.alpha * bias_correction
         sqrt_beta2 = self.beta2 ** 0.5
@@ -123,7 +151,7 @@ class D_ADAM():
         self.t += 1
         return value
     
-class DoWG():
+class DoWG(Rescaler):
     def __init__(self,
                  alpha: float=1,
                  d0: float=1e-6,
@@ -136,7 +164,9 @@ class DoWG():
         self.x0 = None
         pass
 
-    def step(self, val: np.ndarray, iterate=None):
+    def step(self, 
+             val: ndarray, 
+             iterate: ndarray=None):
         assert iterate is not None
         if self.x0 is None: self.x0 = iterate
         

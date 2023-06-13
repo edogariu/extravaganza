@@ -34,24 +34,24 @@ def main():
     from dynamical_systems import SimpleSystem
     
     use_multiprocessing = False
-    num_iters = 10000
+    num_iters = 5000
     num_trials = 1
     controller_args = {
         'h': 1,
         # 'u_clip_size': 1,
         # 'w_clip_size': 1,
-            'M_clip_size': 1e-9,
+            'M_clip_size': 1e-20,
         # 'B_clip_size': 1,  
         # 'update_clip_size': 1,                                
         # 'cost_clip_size': 1,
-        'method': 'FKM',
+        'method': 'REINFORCE',
     }    
     
     # probe_fns = {'disturbances': lambda system, controller: system.controller.ws[0]}
     probe_fns = {'disturbances': lambda system, controller: system.controller.ws[0] * system.controller.M[0],
                  'grads': lambda system, controller: np.mean(system.controller._grad),
                  'Bs': lambda system, controller: system.controller.B if system.controller.B is not None else 0}
-    system = SimpleSystem(f, d_f, controller_args, predict_differences=True, use_grad=False, use_B=False, probe_fns=probe_fns)
+    system = SimpleSystem(f, d_f, controller_args, predict_differences=True, use_grad=True, use_B=True, probe_fns=probe_fns)
     stats = run(system, num_iters, num_trials, controller_args=None, use_multiprocessing=use_multiprocessing)
     results = {'GPC': stats}
     plot_results(results, num_iters // 200, 'test')
@@ -88,7 +88,7 @@ def run_interaction_loop(system: DynamicalSystem,
             system.reset()
         if step_controller:
             f = system.interact(controller)
-            # if t % step_every == 0: controller.step(obj=f, B=0)
+            if t % step_every == 0: controller.step(obj=f)
         else:
             system.interact(None)
     if use_multiprocessing:

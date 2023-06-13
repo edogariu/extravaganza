@@ -320,7 +320,7 @@ class COCO(DynamicalSystem):
         pass
     
     def get_init(self) -> Tuple[float, Tuple[float, float]]:  # returns initial value and desired interval
-        return (self.initial_x[self.u_index], self.interval) if not self.predict_differences else (0, self.interval)
+        return (self.initial_x[self.u_index], self.interval) if not self.predict_differences else (0, (-1, 1))
         
     def interact(self, control: FloatController):
         if hasattr(control, 'item'): 
@@ -328,17 +328,20 @@ class COCO(DynamicalSystem):
         else:
             c = control
             
-        x = self.x.copy()
-        x[self.u_index] = c if not self.predict_differences else x[self.u_index] + c
-        obj = self.problem(x)
+        if self.predict_differences:
+            self.x[self.u_index] += c
+        else:
+            self.x[self.u_index] = c
+        
+        obj = self.problem(self.x)
         
         # probe and cache desired quantities
-        self.stats['controls'][self.t] = x[self.u_index]
+        self.stats['controls'][self.t] = self.x[self.u_index]
         self.stats['objectives'][self.t] = obj
         for k, f in self.probe_fns.items():
             self.stats[k][self.t] = f(self, control)
         self.t += 1
-        return obj
+        return float(obj)
     
         
 class SimpleSystem(DynamicalSystem):
