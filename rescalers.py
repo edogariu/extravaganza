@@ -21,6 +21,13 @@ class Rescaler:
         """
         pass
 
+class IDENTITY(Rescaler):
+    def __init__(self) -> None:
+        super().__init__()
+        
+    def step(self, val: ndarray, iterate: ndarray = None) -> ndarray:
+        return val
+
 class FIXED_RESCALE(Rescaler):
     def __init__(self,
                  alpha: float=1,
@@ -128,13 +135,14 @@ class D_ADAM(Rescaler):
         self.growth_rate = growth_rate
         
         self.d = d0
-        self.m = 0.; self.v = 0.; self.s = 0.; self.r = 0.
+        self.m, self.v, self.s, self.r = np.zeros((4, 1))
         self.t = 1
         pass
 
     def step(self, 
              val: ndarray, 
              iterate: ndarray=None):
+        if isinstance(val, float): val = np.array(val)
         bias_correction = (1 - self.beta2 ** self.t) ** 0.5 / (1 - self.beta1 ** self.t) if self.use_bias_correction else 1
         alpha_t = self.d * self.alpha * bias_correction
         sqrt_beta2 = self.beta2 ** 0.5
@@ -143,7 +151,7 @@ class D_ADAM(Rescaler):
         self.m = self.beta1 * self.m + (1 - self.beta1) * val * alpha_t  # NOTE the `* alpha_t` is not in vanilla ADAM
         self.v = self.beta2 * self.v + (1 - self.beta2) * val ** 2
         self.s = sqrt_beta2 * self.s + (1 - sqrt_beta2) * val * alpha_t
-        self.r = sqrt_beta2 * self.r + (1 - sqrt_beta2) * np.dot(val, self.s / denom) * alpha_t
+        self.r = sqrt_beta2 * self.r + (1 - sqrt_beta2) * np.dot(val.reshape(-1), self.s.reshape(-1) / denom.reshape(-1)) * alpha_t
         d_hat = self.r / ((1 - sqrt_beta2) * np.abs(self.s).sum() + self.eps)
         self.d = max(self.d, min(d_hat, self.d * self.growth_rate))
         
@@ -171,7 +179,7 @@ class DoWG(Rescaler):
         if self.x0 is None: self.x0 = iterate
         
         self.d = max(self.d, np.linalg.norm(iterate - self.x0))
-        self.m = self.m + self.d ** 2 * np.dot(val, val)
+        self.m = self.m + self.d ** 2 * np.dot(val.reshape(-1), val.reshape(-1))
         eta = self.alpha * self.d ** 2 / (self.m ** 0.5 + self.eps)
         value = eta * val
         return value

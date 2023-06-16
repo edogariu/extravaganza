@@ -17,13 +17,13 @@ def main():
     from dynamical_systems import COCO
     
     use_multiprocessing = False
-    num_iters = 10000
+    num_iters = 500
     num_trials = 1
     controller_args = {
         'h': 10,
         'w_clip_size': 0.1,
         # 'M_clip_size': 1e-20,
-        'method': 'REINFORCE',
+        'method': 'FKM',
     }
     
     # things it breaks for:
@@ -37,7 +37,7 @@ def main():
                  'Ms': lambda system, controller: np.dot(controller.M[:-1], list(controller.ws)[:controller.h]),
                  'M0s': lambda system, controller: controller.M[-1]}
     
-    p_idx = 683 # np.random.randint(2160)
+    p_idx = 2049 # np.random.randint(2160)
     c_idx = 0
     system = COCO(p_idx, c_idx, predict_differences=False, probe_fns=probe_fns)
     print('Problem index is {}, coordinate index is {}, problem description is {}!'.format(p_idx, c_idx, system.problem))

@@ -58,9 +58,9 @@ class FloatController(FloatWrapper):
         self._grad = deque([0], maxlen=1)  # for plotting gradients
         
         self.updates = deque(maxlen=self.h)
-        self.update = FIXED_RESCALE(alpha=1e-6, beta=0)
-        # self.update = ADAM(alpha=0.01, betas=(0.9, 0.999), use_bias_correction=False)
-        # self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.0005, use_bias_correction=True)
+        # self.update = FIXED_RESCALE(alpha=1e-6, beta=0)
+        self.update = ADAM(alpha=0.01, betas=(0.9, 0.999), use_bias_correction=False)
+        # self.update = D_ADAM(betas=(0.9, 0.999), growth_rate=1.02, use_bias_correction=True)
         # self.update = DoWG(alpha=500)
         # self.obj = EMA_RESCALE(beta=0.9)
         # self.obj = ADAM(betas=(0.99, 0.999))
@@ -68,8 +68,8 @@ class FloatController(FloatWrapper):
         self.w = EMA_RESCALE(beta=0.9)
         # self.w = ADAM(betas=(0.9, 0.999), use_bias_correction=True)
         
-        self.delta = 0.1
-        self.sigma_max = 0.1
+        self.delta = 0.01
+        self.sigma_max = 0.01
         self.wait = 50
         self.B_momentum = 0.999
                 
@@ -128,7 +128,7 @@ class FloatController(FloatWrapper):
         # observe 
         diff = obj - self.prev_obj
         if B is None:
-            # self.B_momentum = 1 - 1 / self.t
+            self.B_momentum = 1 - 1 / self.t
             # self.B = self.B_momentum * self.B + (1 - self.B_momentum) * obj * self.r / self.sigma
             self.B = self.B_momentum * self.B + (1 - self.B_momentum) * diff * self.r / self.sigma ** 2
             self.B = np.clip(self.B, -self.B_clip_size, self.B_clip_size)
@@ -137,7 +137,7 @@ class FloatController(FloatWrapper):
         w = obj - pred  # w_t = s_t - \hat{s_t}
         self.prev_obj = obj
         
-        w = self.w.step(w)
+        # w = self.w.step(w)
         w = np.clip(w, -self.w_clip_size, self.w_clip_size)
                 
         # compute scale
