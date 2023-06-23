@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 from numpy import ndarray
@@ -20,6 +20,11 @@ class Rescaler:
             any iterates helpful for the computation, by default None
         """
         pass
+    
+    def __call__(self, 
+                 val: ndarray,
+                 iterate: ndarray=None) -> ndarray:
+        return self.step(val, iterate)
 
 class IDENTITY(Rescaler):
     def __init__(self) -> None:

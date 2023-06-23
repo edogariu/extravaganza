@@ -9,6 +9,7 @@ scikit-learn
 matplotlib
 pandas
 pathos
+gymnasium[classic-control]
 
 # hypergradient descent for baseline
 git+https://github.com/gbaydin/hypergradient-descent.git

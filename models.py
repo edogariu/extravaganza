@@ -3,12 +3,16 @@ from typing import List, Iterable
 import torch
 import torch.nn as nn
 
+from utils import set_seed
+
 class MLP(nn.Module):
     def __init__(self, 
                  layer_dims: List[int], 
-                 activation: nn.Module=nn.ReLU,
-                 drop_last_activation: bool=True,
-                 use_bias=True):
+                 activation: nn.Module = nn.ReLU,
+                 normalization: nn.Module = nn.Identity,  # normalize before the activation
+                 drop_last_activation: bool = True,
+                 use_bias = True,
+                 seed: int = None):
         """
         Creates a MLP to use as a weak learner
 
@@ -19,7 +23,9 @@ class MLP(nn.Module):
         activation : nn.Module, optional
             activation function, by default nn.ReLU
         """
+        
         super(MLP, self).__init__()
+        set_seed(seed)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -30,6 +36,7 @@ class MLP(nn.Module):
         for i in range(len(layer_dims) - 1):
             in_dim, out_dim = layer_dims[i: i + 2]
             self.layers.append(nn.Linear(in_dim, out_dim, bias=use_bias))
+            self.layers.append(normalization(out_dim))
             self.layers.append(activation())
         if drop_last_activation: self.layers.pop()  # removes activation from final layer
         
@@ -45,8 +52,10 @@ class CNN(nn.Module):
                  input_shape: Iterable,  # should be in CxHxW
                  output_dim: int,
                  activation: nn.Module=nn.ReLU,
-                 use_bias=True):
+                 use_bias=True,
+                 seed: int = None):
         super(CNN, self).__init__()
+        set_seed(seed)
         
         assert len(input_shape) in [2, 3]
         if len(input_shape) == 2: input_shape = (1, *input_shape)
