@@ -5,7 +5,7 @@ old*
 test.py
 exdata
 coco/
-linear_regression.ipynb
+experiments/learning linear.ipynb
 
 
 # Byte-compiled / optimized / DLL files

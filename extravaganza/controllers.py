@@ -4,16 +4,18 @@ from collections import deque
 
 import jax.numpy as jnp
 
-from lifters import Lifter
-from sysid import SysID
-from stats import Stats
-from utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm
+from extravaganza.lifters import Lifter
+from extravaganza.sysid import SysID
+from extravaganza.stats import Stats
+from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm
 
 
 class Controller:
     """
     abstract class for all controllers
     """
+    control_dim: int = None
+    
     @abstractmethod
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         """
@@ -28,21 +30,24 @@ class LiftedBPC(Controller):
                  initial_u: jnp.ndarray,
                  rescalers,
                  initial_scales: Tuple[float, float, float],
-                 lifter: Lifter,
-                 sysid: SysID,
                  T0: int,
                  bounds = None,
                  method = 'REINFORCE',
+                 lifter: Lifter = None,
+                 sysid: SysID = None,
                  K: jnp.ndarray = None,
                  step_every: int = 1,
                  use_sigmoid = True,
                  decay_scales = False,
-                 K_every: int = None,
-                 seed: int = None):
+                 use_K_from_sysid: bool = False,
+                 seed: int = None,
+                 stats: Stats = None):
 
         set_seed(seed)  # for reproducibility
         
         # check things make sense
+        if lifter is None and isinstance(sysid, Lifter): lifter = sysid
+        if sysid is None and isinstance(lifter, SysID): sysid = lifter
         assert lifter.state_dim == sysid.state_dim
         assert lifter.control_dim == sysid.control_dim and initial_u.shape[0] == lifter.control_dim
         self.control_dim = lifter.control_dim
@@ -66,7 +71,7 @@ class LiftedBPC(Controller):
         self.method = method
         self.bounds = bounds
         self.decay_scales = decay_scales
-        self.K_every = K_every
+        self.use_K_from_sysid = use_K_from_sysid
         self.initial_control = initial_u
         self.step_every = step_every
 
@@ -125,7 +130,10 @@ class LiftedBPC(Controller):
         self.K_update_rescaler = rescalers[2]()
         
         # stats
-        self.stats = Stats()
+        if stats is None:
+            print('WARNING: no `Stats` object provided, so the controller will make a new one.')
+            stats = Stats()
+        self.stats = stats
         self.stats.register('||A-BK||_op', float, plottable=True)
         self.stats.register('||A||_op', float, plottable=True)
         self.stats.register('||B||_F', float, plottable=True)
@@ -143,7 +151,6 @@ class LiftedBPC(Controller):
         """
         Returns the control based on current cost and internal parameters.
         """
-        
         # 1. observe next state and update histories
         prev_histories = (self.cost_history, self.control_history)
         self.cost_history = append(self.cost_history, cost)
@@ -160,15 +167,15 @@ class LiftedBPC(Controller):
         # 2. explore for sysid, and then get stabilizing controller
         if self.t < self.T0:
             control = self.sysid.perturb_control(state)
+            if self.bounds is not None: control = control.clip(*self.bounds)
             self.prev_state = state
             self.prev_control = control
             return control
-        elif self.K_every is not None:  
-            if self.t == self.T0 or (self.t - self.T0) % self.K_every == 0:  # get the K from sysid every so often
-                print('copying the K from {}'.format(self.sysid))
-                self.K = self.sysid.get_lqr()
-                pass
-        
+        elif self.use_K_from_sysid and self.t == self.T0:  # get the K from sysid every so often
+            print('copying the K from {}'.format(self.sysid))
+            self.K = self.sysid.get_lqr()
+            pass
+    
         # 3. compute disturbance
         pred_state = self.sysid.dynamics(self.prev_state, self.prev_control)  # A @ xhat_t + B @ u_t
         disturbance = state - pred_state  # xhat_{t+1} - (A @ xhat_t + B @ u_t)
@@ -209,6 +216,7 @@ class LiftedBPC(Controller):
             M0_tilde = M0_tilde + M0_scale * eps
             if M0_scale > 0: self.eps = append(self.eps, eps / M0_scale)
             
+        # TODO this might not be the right thing to do with `K` when rescaling!!!!
         control = self.inv_rescale_u(-K_tilde @ state) + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
         control = self.rescale_u(control)
 #         control = self.sysid.perturb_control(state, control=control)  # perturb for sysid purposes later than T0?
@@ -237,14 +245,41 @@ class LiftedBPC(Controller):
     
 
 # ---------------------------------------------------------------------------------------------------------------------
+#         VARIOUS BASELINES
+# ---------------------------------------------------------------------------------------------------------------------
 
 from deluca.agents._lqr import LQR as _LQR
 from deluca.agents._gpc import GPC as _GPC
 from deluca.agents._bpc import BPC as _BPC
     
+def get_seed(kwargs):
+    if 'seed' in kwargs:
+            seed = kwargs['seed']
+            del kwargs['seed']
+    else:
+        seed = None
+    return seed
+    
+class ConstantController(Controller):
+    def __init__(self, value: float, control_dim: int, stats: Stats = None) -> None:
+        super().__init__()
+        self.value = float(value)
+        self.control_dim = control_dim
+        if stats is None:
+            print('WARNING: no `Stats` object provided, so the controller will make a new one.')
+            stats = Stats()
+        self.stats = stats
+        pass
+    
+    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+        return jnp.full(shape=(self.control_dim,), fill_value=self.value)
+    
+    
 class LQR(_LQR):
     def __init__(self, *args, **kwargs):
+        set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
+        self.control_dim = self.K.shape[0]
         self.stats = Stats()
         pass
     
@@ -253,7 +288,9 @@ class LQR(_LQR):
     
 class GPC(_GPC):
     def __init__(self, *args, **kwargs):
+        set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
+        self.control_dim = self.K.shape[0]
         self.stats = Stats()
         self.stats.register('K @ state', float, plottable=True)
         self.stats.register('M \cdot w', float, plottable=True)
@@ -273,7 +310,9 @@ class GPC(_GPC):
     
 class BPC(_BPC):
     def __init__(self, *args, **kwargs):
+        set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
+        self.control_dim = self.K.shape[0]
         self.stats = Stats()
         self.stats.register('K @ state', float, plottable=True)
         self.stats.register('M \cdot w', float, plottable=True)
@@ -292,13 +331,16 @@ class BPC(_BPC):
         return self(state, cost)
     
 class RBPC(Controller):  # from Udaya
-    def __init__(self, A, B, Q, R, M, H, lr, delta, noise_sd):
+    def __init__(self, A, B, Q, R, M, H, lr, delta, noise_sd, seed: int = None):
+        set_seed(seed)
         n, m = B.shape
         self.n, self.m = n, m
         self.lr, self.A, self.B, self.M, self.H, self.noise_sd = lr, A, B, M, H, noise_sd
         self.x, self.u, self.delta, self.t = jnp.zeros((n, 1)), jnp.zeros((m, 1)), delta, 0
         self.K, self.E, self.W = LQR(A, B, Q, R).K, jnp.zeros((M, n, m)), jnp.zeros((M + H -1, n))
         self.eps = sample(jkey(), (self.M, self.m), 'sphere')
+        self.cost = 0.
+        self.control_dim = self.K.shape[0]
         
         self.stats = Stats()
         self.stats.register('K @ state', float, plottable=True)
@@ -315,7 +357,8 @@ class RBPC(Controller):  # from Udaya
 
     def act(self, x, cost):
         # 1. Get gradient estimates
-        delta_E = self.Egrad(cost)
+        delta_E = self.Egrad(cost - self.cost)
+        self.cost - cost
 
         # 2. Execute updates
         self.E -= self.lr * delta_E

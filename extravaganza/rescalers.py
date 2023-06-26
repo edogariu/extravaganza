@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Any, Tuple
+from typing import Tuple
 
 import numpy as np
 from numpy import ndarray

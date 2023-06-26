@@ -1,7 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 
-from utils import sample, set_seed, jkey, least_squares, opnorm, dare_gain
+from extravaganza.utils import sample, set_seed, jkey, least_squares, opnorm, dare_gain
 
 class SysID:
     """
@@ -79,7 +79,7 @@ class SysID:
             controls = np.array(self.control_history)
 
             # regression on A and B jointly
-            A, B = least_squares(states, controls, max_opnorm=1.)
+            A, B = least_squares(states, controls, max_opnorm=None)
                 
         self.A, self.B = A, B
         return A, B

@@ -5,6 +5,6 @@ setup(
    version='1.0',
    description='GPC for hyperparameters',
    author='the dog',
-   packages=[],  #same as name
+   packages=['extravaganza', 'experiments'],  #same as name
    install_requires=[], #external packages as dependencies
 )

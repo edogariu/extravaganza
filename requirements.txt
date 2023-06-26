@@ -10,6 +10,7 @@ matplotlib
 pandas
 pathos
 gymnasium[classic-control]
+deluca
 
 # hypergradient descent for baseline
 git+https://github.com/gbaydin/hypergradient-descent.git

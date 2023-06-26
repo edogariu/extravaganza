@@ -2,14 +2,13 @@ from abc import abstractmethod
 import inspect
 from typing import Tuple
 from collections import deque
-import random
 
 import numpy as np
 import jax.numpy as jnp
 
-from models import MLP
-from sysid import SysID
-from utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain
+from extravaganza.models import MLP
+from extravaganza.sysid import SysID
+from extravaganza.utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain
 
 class Lifter:
     """
@@ -40,17 +39,14 @@ class Lifter:
 
     @abstractmethod
     def update(self,
-               prev_state: jnp.ndarray,
-               state: jnp.ndarray,
-               control: jnp.ndarray,
-               sysid: SysID) -> float:
+               prev_histories: Tuple[jnp.ndarray, jnp.ndarray],
+               histories: Tuple[jnp.ndarray, jnp.ndarray]) -> float:
         """
-        Called with the previous state, the control that was applied, the resulting state, and the current
-        estimate of system dynamics.
+        Called with the previous state and the resulting state, given as `(cost, control)` history tuples.
         Can be used to update the lifting mechanism, or can be a no-op.
-        If updates, it can also return the loss.
+        If updates, it can also return the loss for stat logging.
         """
-        return None  # by default a no-op
+        return 0.  # by default a no-op
     
     
 # ---------------------------------------------------------------------------------------------------
@@ -103,7 +99,7 @@ class RandomLift(Lifter):
         # to compute lifted states which hopefully respond linearly to the controls
         flat_dim = hh  # TODO could add control history as an input as well!
         self.lift_model = MLP(layer_dims = exponential_linspace_int(flat_dim, self.state_dim, depth), 
-                              normalization = lambda dim: torch.nn.LayerNorm(dim),
+                            #   normalization = lambda dim: torch.nn.LayerNorm(dim),
                               use_bias = False, 
                               seed = seed).train().float()
         pass
@@ -126,13 +122,6 @@ class RandomLift(Lifter):
         
         return state
 
-    def update(self,
-               prev_state: jnp.ndarray,
-               state: jnp.ndarray,
-               control: jnp.ndarray,
-               sysid: SysID):
-        pass
-
 # ---------------------------------------------------------------------------------------------------
 
 class LearnedLift(Lifter, SysID):
@@ -146,9 +135,11 @@ class LearnedLift(Lifter, SysID):
                  sysid_lr: float = 0.001,
                  cost_lr: float = 0.001,
                  buffer_maxlen: int = int(1e9),
-                 batch_size: int = 10,
+                 batch_size: int = 64,
+                 num_epochs: int = 20,  # number of epochs over the buffer to use when querying `sysid()` or `dynamics()` for first time
                  seed: int = None):
         
+        set_seed(seed)
         super().__init__(hh, control_dim, state_dim, seed)
         
         self.hh = hh
@@ -157,12 +148,13 @@ class LearnedLift(Lifter, SysID):
         self.scale = scale
         
         self.buffer = deque(maxlen=buffer_maxlen)
+        self.num_epochs = num_epochs
         self.batch_size = batch_size
         
         # to compute lifted states which hopefully respond linearly to the controls
-        flat_dim = hh  # TODO could add control history as an input as well!
+        flat_dim = hh + control_dim * hh  # TODO could add control history as an input as well!
         self.lift_model = MLP(layer_dims=exponential_linspace_int(flat_dim, self.state_dim, depth), 
-                              normalization = lambda dim: torch.nn.LayerNorm(dim),
+                            #   normalization = lambda dim: torch.nn.LayerNorm(dim),
                               use_bias=False, 
                               seed=seed).train().float()
         self.lift_opt = torch.optim.Adam(self.lift_model.parameters(), lr=lift_lr)
@@ -172,20 +164,20 @@ class LearnedLift(Lifter, SysID):
         self.B = torch.nn.Parameter(0.5 * torch.randn((self.state_dim, self.control_dim), dtype=torch.float32))
         self.sysid_opt = torch.optim.Adam([self.A, self.B], lr=sysid_lr)
         
+        # to learn "inverse" of lifing function
         self.cost_model = MLP(layer_dims=exponential_linspace_int(self.state_dim + self.control_dim, 1, depth),
                               seed=seed).train().float()
         self.cost_opt = torch.optim.Adam(self.cost_model.parameters(), lr=cost_lr)
         
         self.t = 1
+        self.trained = False
         pass
     
     def forward(self, 
-                cost_history: jnp.ndarray,
-                control_history: jnp.ndarray) -> torch.Tensor:  # so that we don't need to return a jnp.ndarray
-        
-        # convert to pytorch tensors rq
-        cost_history, control_history = map(lambda j_arr: torch.from_numpy(np.array(j_arr)), [cost_history, control_history])
-        state = self.lift_model(cost_history.unsqueeze(0)).squeeze()
+                cost_history: torch.Tensor,
+                control_history: torch.Tensor) -> torch.Tensor:  # so that we don't need to return a jnp.ndarray
+        inp = torch.cat((cost_history.reshape(-1, self.hh), control_history.reshape(-1, self.control_dim * self.hh)), dim=-1)
+        state = self.lift_model(inp)
         return state
     
     def map(self,
@@ -197,8 +189,10 @@ class LearnedLift(Lifter, SysID):
         assert cost_history.shape == (self.hh,)
         assert control_history.shape == (self.hh, self.control_dim)
         
-        state = self.forward(cost_history, control_history)
-        state = jnp.array(state.data.numpy())  # convert back to jnp  # TODO remove this eventually
+        # convert to pytorch tensors and back rq  # TODO remove this eventually, making everything in jax
+        with torch.no_grad():
+            cost_history, control_history = map(lambda j_arr: torch.from_numpy(np.array(j_arr)).unsqueeze(0), [cost_history, control_history])
+            state = jnp.array(self.forward(cost_history, control_history).squeeze(0).data.numpy())
         
         return state
     
@@ -211,67 +205,73 @@ class LearnedLift(Lifter, SysID):
         self.t += 1
         return control
     
+    def train(self):
+        print('training!')
+            
+        # prepare dataloader
+        from torch.utils.data import DataLoader, TensorDataset
+        controls = []
+        prev_cost_history = []
+        prev_control_history = []
+        cost_history = []
+        control_history = []
+        for prev_histories, histories in self.buffer:  # append em all
+            lists = [controls, prev_cost_history, prev_control_history, cost_history, control_history]
+            vals = [histories[1][-1], *prev_histories, *histories]
+            for l, v in zip(lists, vals): l.append(torch.from_numpy(np.array(v)))
+        dataset = TensorDataset(*map(lambda l: torch.stack(l, dim=0), 
+                                     [prev_cost_history, prev_control_history, cost_history, control_history, controls]))
+        dl = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        
+        losses = []
+        for t in range(self.num_epochs):
+            for prev_cost_history, prev_control_history, cost_history, control_history, controls in dl:
+                
+                # compute disturbance
+                prev_state = self.forward(prev_cost_history, prev_control_history)
+                state = self.forward(cost_history, control_history)
+                pred = self.A.expand(self.batch_size, self.state_dim, self.state_dim) @ prev_state.unsqueeze(-1) + \
+                       self.B.expand(self.batch_size, self.state_dim, self.control_dim) @ controls.unsqueeze(-1)
+                diff = state - pred.squeeze(-1)
+                
+                # update
+                self.lift_opt.zero_grad()
+                self.sysid_opt.zero_grad()
+                
+                # compute loss 
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 1e-6, 1e-4
+                norms = (state ** 2).sum() + (prev_state ** 2).sum()
+                state_norm = norms + 1 / (norms + 1e-8)
+                stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
+                B_norm = 1 / torch.norm(self.B)
+                loss = torch.mean(diff ** 2) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
+                loss.backward()
+                self.lift_opt.step()
+                self.sysid_opt.step()
+                
+                # self.cost_opt.zero_grad()
+                # fhat = self.cost_model(torch.cat((prev_state.detach(), control), dim=-1).reshape(-1, self.state_dim + self.control_dim))  # predict cost from state and control we played from that state
+                # f = histories[0][-1]
+                # loss = torch.nn.functional.mse_loss(fhat.squeeze(), torch.from_numpy(np.array(f)).squeeze())
+                # loss.backward()
+                # self.cost_opt.step()
+                
+                losses.append(loss.item())
+                
+            print_every = 25
+            if t % print_every == 0: print('mean loss for past {} epochs was {}'.format(print_every, np.mean(losses[-print_every:])))
+            
+        self.trained = True
+        return losses
+    
     def sysid(self):
+        if not self.trained:
+            self.losses = self.train()
+        
         return jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
-
-    # def learn(self):
-    #     sample = random.sample(self.buffer, self.batch_size)
-        
-    #     losses = 0.
-    #     for prev_histories, histories, control in sample:
-    #         # convert
-    #         if isinstance(control, jnp.ndarray):
-    #             control = torch.from_numpy(np.array(control)).reshape(self.control_dim) 
-    #         elif not isinstance(control, torch.Tensor): 
-    #             control = torch.tensor(control).reshape(self.control_dim)
-    #         if isinstance(prev_histories, jnp.ndarray):
-    #             prev_histories = [torch.from_numpy(np.array(arr)) for arr in prev_histories]
-    #             histories = [torch.from_numpy(np.array(arr)) for arr in histories]
-            
-    #         # compute disturbance
-    #         prev_state = self.forward(*prev_histories)
-    #         state = self.forward(*histories)
-    #         pred = self.A @ prev_state + self.B @ control
-    #         diff = state - pred
-            
-    #         # update
-    #         self.lift_opt.zero_grad()
-    #         self.sysid_opt.zero_grad()
-            
-    #         # compute loss 
-    #         LAMBDA_NORM, LAMBDA_STABILITY = 1e-5, 1e-6
-    #         norms = torch.linalg.norm(state) + torch.linalg.norm(prev_state)
-    #         norm = norms + 1 / (norms + 1e-8)
-    #         stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
-    #         loss = torch.mean(diff ** 2) + LAMBDA_NORM * norm + LAMBDA_STABILITY * stability
-    #         loss.backward()
-    #         self.lift_opt.step()
-    #         self.sysid_opt.step()
-            
-    #         # self.cost_opt.zero_grad()
-    #         # fhat = self.cost_model(torch.cat((prev_state.detach(), control), dim=-1).reshape(-1, self.state_dim + self.control_dim))  # predict cost from state and control we played from that state
-    #         # f = histories[0][-1]
-    #         # loss = torch.nn.functional.mse_loss(fhat.squeeze(), torch.from_numpy(np.array(f)).squeeze())
-    #         # loss.backward()
-    #         # self.cost_opt.step()
-            
-    #         losses += loss.item()
-            
-    #     losses /= self.batch_size
-    #     return losses
-
-    # def update(self,
-    #            prev_histories: Tuple[jnp.ndarray, jnp.ndarray],
-    #            histories: Tuple[jnp.ndarray, jnp.ndarray],
-    #            control: jnp.ndarray,
-    #            sysid: SysID) -> float:
-        
-    #     transition = (prev_histories, histories, control)
-    #     self.buffer.append(transition)
-        
-    #     if len(self.buffer) >= self.batch_size:
-    #         loss = self.learn()
-    #     else:
-    #         loss = None
-    #     return loss
-     
+    
+    def update(self, 
+               prev_histories: Tuple[jnp.ndarray, jnp.ndarray], 
+               histories: Tuple[jnp.ndarray, jnp.ndarray]) -> float:
+        self.buffer.append((prev_histories, histories))  # add the transition
+        return 0.

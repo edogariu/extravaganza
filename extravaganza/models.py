@@ -3,7 +3,7 @@ from typing import List, Iterable
 import torch
 import torch.nn as nn
 
-from utils import set_seed
+from extravaganza.utils import set_seed
 
 class MLP(nn.Module):
     def __init__(self, 
