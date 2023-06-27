@@ -209,7 +209,7 @@ class MNIST(NNTraining):
 
         # data
         self.train_dl = DataLoader(
-            torchvision.datasets.MNIST('./data', train=True, download=True,
+            torchvision.datasets.MNIST('.data', train=True, download=True,
                            transform=torchvision.transforms.Compose([
                                torchvision.transforms.ToTensor(),
                                torchvision.transforms.Normalize((0.1307,), (0.3081,))
@@ -309,8 +309,8 @@ class LDS(DynamicalSystem):
                            'constant': lambda t: 1.,
                            'gaussian': lambda t: np.random.randn() * 0.1,  # variance of 0.01
                         #    'linear': lambda t: float(t),  # this one is stupid
-                           'sinusoidal': lambda t: np.sin(2 * np.pi * t / 100),  # period of 100 steps
-                           'square wave': lambda t: np.ceil(t / 100) % 2  # period of 40 
+                           'sinusoidal': lambda t: np.sin(2 * np.pi * t / 500),  # period of 500 steps
+                           'square wave': lambda t: np.ceil(t / 500) % 2  # period of 500 
                            }
         assert disturbance_type in disturbance_fns
         self.disturbance = disturbance_fns[disturbance_type]

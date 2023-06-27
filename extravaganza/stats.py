@@ -144,6 +144,7 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             ts = [v[0] for v in stat.value]
             vals = [v[1] for v in stat.value]
             ax.plot(ts, vals, fmt, label=label)
+        ax.set_xlabel('timestep (t)')
 
         return ax
     

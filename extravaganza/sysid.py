@@ -79,7 +79,7 @@ class SysID:
             controls = np.array(self.control_history)
 
             # regression on A and B jointly
-            A, B = least_squares(states, controls, max_opnorm=None)
+            A, B = least_squares(states, controls, max_opnorm=1.)
                 
         self.A, self.B = A, B
         return A, B

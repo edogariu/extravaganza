@@ -11,6 +11,7 @@ pandas
 pathos
 gymnasium[classic-control]
 deluca
+dill
 
 # hypergradient descent for baseline
 git+https://github.com/gbaydin/hypergradient-descent.git

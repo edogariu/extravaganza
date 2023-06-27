@@ -138,6 +138,8 @@ class LiftedBPC(Controller):
         self.stats.register('||A||_op', float, plottable=True)
         self.stats.register('||B||_F', float, plottable=True)
         self.stats.register('disturbances', float, plottable=True)
+        self.stats.register('costs', float, plottable=True)
+        self.stats.register('avg costs', float, plottable=True)
         self.stats.register('lifter losses', float, plottable=True)
         if self.control_dim == 1:
             self.stats.register('K @ state', float, plottable=True)
@@ -166,7 +168,7 @@ class LiftedBPC(Controller):
         
         # 2. explore for sysid, and then get stabilizing controller
         if self.t < self.T0:
-            control = self.sysid.perturb_control(state)
+            control = self.sysid.perturb_control(state)  # TODO should rescaling be applied to this?
             if self.bounds is not None: control = control.clip(*self.bounds)
             self.prev_state = state
             self.prev_control = control
@@ -219,6 +221,7 @@ class LiftedBPC(Controller):
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
         control = self.inv_rescale_u(-K_tilde @ state) + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
         control = self.rescale_u(control)
+        if self.bounds is not None: control = jnp.clip(control, *self.bounds)
 #         control = self.sysid.perturb_control(state, control=control)  # perturb for sysid purposes later than T0?
 
         # cache it
@@ -232,6 +235,7 @@ class LiftedBPC(Controller):
         self.stats.update('||A||_op', opnorm(A), t=self.t)
         self.stats.update('||B||_F', jnp.linalg.norm(B, 'fro').item(), t=self.t)
         self.stats.update('disturbances', jnp.linalg.norm(disturbance).item(), t=self.t)
+        self.stats.update('costs', cost, t=self.t)
         self.stats.update('lifter losses', lifter_loss, t=self.t)
         if self.control_dim == 1:
             self.stats.update('K @ state', (-self.K @ state).item(), t=self.t)

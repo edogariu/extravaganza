@@ -239,9 +239,9 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss 
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 0, 0
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-4, 0, 0
                 norms = (state ** 2).sum() + (prev_state ** 2).sum()
-                state_norm = (1 / (norms + 1e-8)) #+ norms
+                state_norm = (1 / (norms + 1e-8))# + norms
                 stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8)
                 loss = torch.mean(diff ** 2) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
