@@ -239,10 +239,9 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss 
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 0, 0, 0
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 0, 0
                 norm = torch.norm(state)
-                print(norm)
-                state_norm = (1 / (norm + 1e-8)) + norm if LAMBDA_STATE_NORM > 0 else 0.
+                state_norm = (1 / (norm + 1e-8)) #+ norm if LAMBDA_STATE_NORM > 0 else 0.
                 stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
                 loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
@@ -260,7 +259,7 @@ class LearnedLift(Lifter, SysID):
                 losses.append(loss.item())
                 
             print_every = 25
-            if t % print_every == 0: print('mean loss for past {} epochs was {}'.format(print_every, np.mean(losses[-print_every:])))
+            if t % print_every == 0 or t == self.num_epochs - 1: print('mean loss for past {} epochs was {}'.format(print_every, np.mean(losses[-print_every:])))
             
         self.trained = True
         return losses
@@ -268,8 +267,12 @@ class LearnedLift(Lifter, SysID):
     def sysid(self):
         if not self.trained:
             self.losses = self.train()
+            A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
+            print('||A||_op = {}     ||B||_F {}'.format(opnorm(A), jnp.linalg.norm(B, 'fro')))
+            return A, B
         
-        return jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
+        A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
+        return A, B
     
     def update(self, 
                prev_histories: Tuple[jnp.ndarray, jnp.ndarray], 

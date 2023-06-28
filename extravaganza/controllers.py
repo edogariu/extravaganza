@@ -25,6 +25,10 @@ class Controller:
 
 
 class LiftedBPC(Controller):
+    """
+    Naturally expected to output on the scale of `(-1, 1)`.
+    If `bounds` is not `None`, it will automatically clip (or apply `tanh`) and rescale to the given bounds.
+    """
     def __init__(self,
                  h: int,
                  initial_u: jnp.ndarray,
@@ -37,7 +41,7 @@ class LiftedBPC(Controller):
                  sysid: SysID = None,
                  K: jnp.ndarray = None,
                  step_every: int = 1,
-                 use_sigmoid = True,
+                 use_tanh = True,
                  decay_scales = False,
                  use_K_from_sysid: bool = False,
                  seed: int = None,
@@ -75,10 +79,10 @@ class LiftedBPC(Controller):
         self.initial_control = initial_u
         self.step_every = step_every
 
-        # for rescaling u
-        self.rescale_u = lambda u: rescale(u, self.bounds, use_sigmoid=use_sigmoid) if self.bounds is not None else u
-        self.inv_rescale_u = lambda ru: inv_rescale(ru, self.bounds, use_sigmoid=use_sigmoid) if self.bounds is not None else ru
-        self.d_rescale_u = lambda u: d_rescale(u, self.bounds, use_sigmoid=use_sigmoid) if self.bounds is not None else jnp.ones_like(u)        
+        # for rescaling controls
+        self.rescale_u = lambda u: rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else u
+        self.inv_rescale_u = lambda ru: inv_rescale(ru, self.bounds, use_tanh=use_tanh) if self.bounds is not None else ru
+        self.d_rescale_u = lambda u: d_rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else jnp.ones_like(u)        
         
         # controller params
         self.M = jnp.zeros((self.h, self.control_dim, self.state_dim))

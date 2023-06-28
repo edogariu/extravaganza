@@ -126,44 +126,38 @@ def sample(jkey: jax.random.KeyArray,
     assert v.shape == shape, 'needed {} and got {}'.format(shape, v.shape)
     return v
     
-def _sigmoid(t):
-    return 1 / (1 + np.exp(-t))
-
-def _inv_sigmoid(s):
-    if s < 1e-9: return -1e9
-    return np.log(s / max(1 - s, 1e-7))
-
-def _d_sigmoid(t):
-    s = _sigmoid(t)
-    return s * (1 - s)
-
-def rescale(t, bounds, use_sigmoid):
+def _arctanh(t):
     """
-    rescales from `[0, 1] -> [tmin, tmax]`
+    returns inverse of tanh
+    """ 
+    assert jnp.all(jnp.abs(t) <= 1), 'must be in `[-1, 1]^n` to take inverse hyperbolic tan'   
+    return 0.5 * jnp.log((1 + t) / (1 - t + 1e-8))
+
+def rescale(t, bounds, use_tanh):
+    """
+    rescales from `[-1, 1] -> [tmin, tmax]`
+    
+        `s = clip(t, -1, 1) * (tmax - tmin) / 2 + (tmax + tmin) / 2`
     """
     tmin, tmax = bounds
-    if use_sigmoid: t = _sigmoid(t)
-    # else: 
-    #     if isinstance(t, (np.ndarray, jnp.ndarray)):
-    #         t = jnp.clip(t, 0, 1)
-    #     elif isinstance(s, torch.Tensor):
-    #         t = torch.clamp(t, 0, 1)
-    return tmin + (tmax - tmin) * t
+    if use_tanh: 
+        t = jnp.tanh(t)
+    else: t = jnp.clip(t, -1, 1)
+    t = (tmax - tmin) * t + (tmax + tmin)
+    return t / 2
 
-def d_rescale(t, bounds, use_sigmoid):
+def d_rescale(t, bounds, use_tanh):
     tmin, tmax = bounds
-    d = tmax - tmin
-    if use_sigmoid: d *= _d_sigmoid(t)
+    d = (tmax - tmin) / 2
+    if use_tanh: d *= 1 - jnp.tanh(t) ** 2
     return d
 
-def inv_rescale(s, bounds, use_sigmoid):
-    if isinstance(s, (np.ndarray, jnp.ndarray)):
-        s = jnp.clip(s, *bounds)
-    elif isinstance(s, torch.Tensor):
-        s = torch.clamp(s, *bounds)
+def inv_rescale(s, bounds, use_tanh):
     tmin, tmax = bounds
-    t = (s - tmin) / (tmax - tmin)
-    if use_sigmoid: t = _inv_sigmoid(t)
+    t = (2 * s - tmax - tmin) / (tmax - tmin)
+    if use_tanh: 
+        t = jnp.clip(-1, 1)
+        t = _arctanh(t)
     return t
 
 def exponential_linspace_int(start, end, num, divisible_by=1):
