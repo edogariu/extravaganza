@@ -143,6 +143,11 @@ def rescale(t, bounds, use_sigmoid):
     """
     tmin, tmax = bounds
     if use_sigmoid: t = _sigmoid(t)
+    # else: 
+    #     if isinstance(t, (np.ndarray, jnp.ndarray)):
+    #         t = jnp.clip(t, 0, 1)
+    #     elif isinstance(s, torch.Tensor):
+    #         t = torch.clamp(t, 0, 1)
     return tmin + (tmax - tmin) * t
 
 def d_rescale(t, bounds, use_sigmoid):

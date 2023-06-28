@@ -6,6 +6,7 @@ test.py
 exdata
 coco/
 experiments/learning linear.ipynb
+experiments/.data
 
 
 # Byte-compiled / optimized / DLL files

@@ -1,5 +1,6 @@
 from collections import namedtuple
 from collections.abc import MutableMapping
+from copy import deepcopy
 from typing import Tuple
 import pickle as pkl
 
@@ -7,7 +8,7 @@ import numpy as np
 import jax.numpy as jnp
 import torch
 
-SPECIAL_PREFIXES = ['avg']
+SPECIAL_PREFIXES = ['avg']  # if one of these prefixes the name of a stat, it has auto-defined behavior
 
 class Stats(MutableMapping):  # maps keys to the corresponding stats!
     """
@@ -24,9 +25,10 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
                  key,
                  obj_class = None,
                  shape = None,
-                 plottable: bool = None,
+                 plottable: bool = False,
                  use_special_prefixes: bool = True):
-        if key not in self._stats:
+        if key not in self._stats:  # if we already have it, it's a no-op
+            
             if use_special_prefixes and 'avg' in key:  # for automatically calculating the cumulative mean of a stat, just register '`avg __stat_name__'`
                 assert 'avg' in SPECIAL_PREFIXES
                 prefix, stat_name = key.split(' ')
@@ -35,35 +37,37 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
                 print('registering running average of {}'.format(stat_name))
                 self._avgs.append(stat_name)
                 
-            self._stats[key] = namedtuple('Stat', ['value', 
+            self._stats[key] = namedtuple('Stat', ['t',
+                                                   'value', 
                                                    'obj_class', 
                                                    'shape',
                                                    'plottable']
-                                          )([], obj_class, shape, plottable)
+                                          )([], [], obj_class, shape, plottable)
         return self
         
     def update(self, key, value, t: int = None):
+        # make sure things make sense
         if self.aggregated: raise Exception('cannot update aggregated statistics')
         if value is None: return
-        assert key in self._stats, 'please register {} with `stats.register(\'{}\', *__otherdetails__)`'.format(key, key)
+        assert key in self._stats, 'please register {} with `stats.register(\'{}\', ...)`'.format(key, key)
         stat = self._stats[key]
         if stat.obj_class is not None: assert isinstance(value, stat.obj_class), value.__class__
         if stat.shape is not None and isinstance(value, (np.ndarray, jnp.ndarray, torch.Tensor)): assert value.shape == stat.shape, value.shape
         if stat.plottable is not None: assert t is not None
         
-        if t is not None: value = (t, value)
-        self._stats[key].value.append(value)
+        # update stat (and any running stats)
+        if t is not None: stat.t.append(t)
+        stat.value.append(value)
         if key in self._avgs: 
-            if t is not None: 
-                avg = (t, np.mean([v[1] for v in self._stats[key].value]))
-            else:
-                avg = np.mean(self._stats[key].value)
-            self._stats['avg {}'.format(key)].value.append(avg)
+            avg_stat = self._stats['avg {}'.format(key)]
+            if t is not None: avg_stat.t.append(t)
+            avg_stat.value.append(np.mean(stat.value))
         pass
     
     def pop(self, idx: int = -1):
         if self.aggregated: raise Exception('cannot pop aggregated statistics')
         for stat in self._stats.values():
+            stat.t.pop(idx)
             stat.value.pop(idx)
         return self
     
@@ -97,32 +101,20 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             assert not _stats.aggregated, 'cannot aggregate already aggregated stats! (it would be too confusing for me)'
             for k, stat in _stats._stats.items():
                 # if any([prefix in k for prefix in SPECIAL_PREFIXES]): continue  # skip avgs and such
-                if len(stat.value) == 0: continue
-                if stat.plottable:
-                    ts = [v[0] for v in stat.value]
-                    vs = jnp.array([v[1] for v in stat.value])
-                    v = (ts, vs)
-                else:
-                    v = jnp.array(stat.value)
-                    
                 aggregate_stats.register(k, plottable=stat.plottable, use_special_prefixes=False)
-                aggregate_stats.update(k, v, t=0)  # dummy t dimension
+                aggregate_stats.update(k, stat.value, t=stat.t)  # each entry in `aggregate_stats` is the entire list from a `Stats` object
                 
-        for k, stat in aggregate_stats._stats.items():
-            if stat.plottable:
-                value = [v[1] for v in stat.value if isinstance(v[1][1], jnp.ndarray)]  # ignore dummy t dimension
-                ts = jnp.array([v[0] for v in value])
-                vs = jnp.array([v[1] for v in value]).reshape(len(value), ts.shape[1], *((1,) if stat.shape is None else stat.shape))
-                mean, std = vs.mean(axis=0), vs.std(axis=0)
-                # assert ts.std(axis=0).mean() < 1e-4, (ts, k)
+        for k, agg_stat in aggregate_stats._stats.items():
+            vs = jnp.array(agg_stat.value)
+            mean, std = vs.mean(axis=0), vs.std(axis=0)
+            val = (mean.squeeze(), std.squeeze(), vs)
+            aggregate_stats._stats[k].value = val
+            
+            if agg_stat.plottable:
+                ts = jnp.array(agg_stat.t)
                 ts = ts[0].reshape(*mean.shape)
-                val = (ts.squeeze(), mean.squeeze(), std.squeeze(), vs)
-            else:
-                value = [v[1] for v in stat.value if isinstance(v[1], jnp.ndarray)]  # ignore dummy t dimension
-                vs = jnp.stack(value)
-                mean, std = vs.mean(axis=0), vs.std(axis=0)
-                val = (mean.squeeze(), std.squeeze(), vs)
-            aggregate_stats[k] = val
+                # assert ts.std(axis=0).mean() < 1e-4, (ts, k)
+                aggregate_stats._stats[k].t = ts
         
         aggregate_stats.aggregated = True
         return aggregate_stats
@@ -137,20 +129,52 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
 
         if self.aggregated:
             STD_CONFIDENCE = 1.
-            ts, means, stds, _ = stat.value
+            ts = stat.t
+            means, stds, _ = stat.value
             ax.plot(ts, means, fmt, label=label)
             ax.fill_between(ts, means - STD_CONFIDENCE * stds, means + STD_CONFIDENCE * stds, alpha=0.4)
         else:
-            ts = [v[0] for v in stat.value]
-            vals = [v[1] for v in stat.value]
-            ax.plot(ts, vals, fmt, label=label)
+            ax.plot(stat.t, stat.value, fmt, label=label)
         ax.set_xlabel('timestep (t)')
 
         return ax
     
     # everything below here is to ensure we can use the dict interface as well, affecting only values of each of our stats
     def __getitem__(self, key):
-        return self._stats[key].value
+        if isinstance(key, slice):  # for slice interface!!
+            assert any([stat.plottable for stat in self._stats.values()]), 'cant call time slice on stats with no time'
+            max_t = np.max([np.max(stat.t) for stat in self._stats.values() if len(stat.t) > 0])
+            lo, hi, _ = key.indices(max_t)  # ignore the step
+            assert hi >= lo
+            ret = deepcopy(self)
+            for k, stat in ret._stats.items():
+                if not stat.plottable or len(stat.t) == 0: 
+                    print(k, ' was not plottable')
+                    continue
+                assert len(stat.t) == len(stat.value)
+                t = jnp.array(stat.t)
+                assert jnp.allclose(t, jnp.sort(t))  # make sure its sorted
+                ilo = jnp.argmax(t >= lo) if t[-1] >= lo else None
+                ihi = jnp.argmax(t >= hi) if t[0] <= hi else None
+                if ilo is None or ihi is None: 
+                    ts = []
+                    vs = []
+                else:
+                    if t[-1] < hi: ihi = len(stat.t)
+                    ts = stat.t[ilo: ihi]
+                    vs = stat.value[ilo: ihi]
+                ret._stats[k] = ret._stats[k]._replace(t=ts, value=vs)
+            return ret
+            
+        elif isinstance(key, str):
+            return self._stats[key].value
+        elif isinstance(key, tuple):
+            raise NotImplementedError('Tuple as index')
+        else:
+            raise TypeError('Invalid argument type: {}'.format(type(key)))
+        
+    # def __getitem__(self, key):
+    #     return self._stats[key].value
 
     def __setitem__(self, key, value):
         self.register(key)  # no-op if key in self._stats

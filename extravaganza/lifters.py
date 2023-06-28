@@ -99,7 +99,7 @@ class RandomLift(Lifter):
         # to compute lifted states which hopefully respond linearly to the controls
         flat_dim = hh  # TODO could add control history as an input as well!
         self.lift_model = MLP(layer_dims = exponential_linspace_int(flat_dim, self.state_dim, depth), 
-                            #   normalization = lambda dim: torch.nn.LayerNorm(dim),
+                              normalization = lambda dim: torch.nn.LayerNorm(dim),
                               use_bias = False, 
                               seed = seed).train().float()
         pass
@@ -154,7 +154,7 @@ class LearnedLift(Lifter, SysID):
         # to compute lifted states which hopefully respond linearly to the controls
         flat_dim = hh + control_dim * hh  # TODO could add control history as an input as well!
         self.lift_model = MLP(layer_dims=exponential_linspace_int(flat_dim, self.state_dim, depth), 
-                            #   normalization = lambda dim: torch.nn.LayerNorm(dim),
+                              normalization = lambda dim: torch.nn.LayerNorm(dim),
                               use_bias=False, 
                               seed=seed).train().float()
         self.lift_opt = torch.optim.Adam(self.lift_model.parameters(), lr=lift_lr)
@@ -239,12 +239,13 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss 
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-4, 0, 0
-                norms = (state ** 2).sum() + (prev_state ** 2).sum()
-                state_norm = (1 / (norms + 1e-8))# + norms
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 0, 0, 0
+                norm = torch.norm(state)
+                print(norm)
+                state_norm = (1 / (norm + 1e-8)) + norm if LAMBDA_STATE_NORM > 0 else 0.
                 stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
-                B_norm = 1 / (torch.norm(self.B) + 1e-8)
-                loss = torch.mean(diff ** 2) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
+                B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
+                loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
                 loss.backward()
                 self.lift_opt.step()
                 self.sysid_opt.step()

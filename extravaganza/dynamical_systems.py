@@ -482,7 +482,7 @@ class Gym(DynamicalSystem):
         cost = self.cost_fn(self.state)
 
         # update
-        self.stats.update('xs', self.state[0].item(), t=self.t)
+        self.stats.update('xs', self.state[2].item(), t=self.t)
         self.stats.update('us', control.item(), t=self.t)
         # self.stats.update('ws', disturbance, t=self.t)
         self.stats.update('fs', cost, t=self.t)
