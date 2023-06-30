@@ -95,8 +95,10 @@ class LiftedBPC(Controller):
         self.prev_control = jnp.zeros(self.control_dim)
         self.prev_state = jnp.zeros(self.state_dim)
         self.disturbance_history = jnp.zeros((2 * self.h, self.state_dim))  # past 2h disturbances, for controller
+        self.state_history = jnp.zeros((2 * self.h, self.state_dim))
         self.cost_history = jnp.zeros(self.hh)  # for sysid/lifting
         self.control_history = jnp.zeros((self.hh, self.control_dim))  # for sysid/lifting
+        self.cost_accum = 0.
         self.t = 1
 
         # grad estimation stuff -- NOTE maybe `self.eps` should be divided by its variance?
@@ -121,7 +123,8 @@ class LiftedBPC(Controller):
             def grad_M0(diff):
                 return diff * self.eps[-1] #* self.control_dim * self.state_dim * self.h
             def grad_K(diff):
-                val = self.eps[-1].reshape(self.control_dim, 1) @ self.prev_state.reshape(1, self.state_dim)
+                # val = self.eps[-1].reshape(self.control_dim, 1) @ self.prev_state.reshape(1, self.state_dim)
+                val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.state_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)]).sum(axis=0)
                 return diff * val #* self.control_dim * self.state_dim * self.h
             
         self.grads = deque([(jnp.zeros_like(self.M), jnp.zeros_like(self.M0), jnp.zeros_like(self.K))], maxlen=self.h)
@@ -135,7 +138,7 @@ class LiftedBPC(Controller):
         
         # stats
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the controller will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         self.stats.register('||A-BK||_op', float, plottable=True)
@@ -143,6 +146,7 @@ class LiftedBPC(Controller):
         self.stats.register('||B||_F', float, plottable=True)
         self.stats.register('disturbances', float, plottable=True)
         self.stats.register('costs', float, plottable=True)
+        self.stats.register('cost diffs', float, plottable=True)
         self.stats.register('avg costs', float, plottable=True)
         self.stats.register('lifter losses', float, plottable=True)
         if self.control_dim == 1:
@@ -157,6 +161,8 @@ class LiftedBPC(Controller):
         """
         Returns the control based on current cost and internal parameters.
         """
+        # cost = cost - self.cost_accum / self.t  # subtract running avg
+        
         # 1. observe next state and update histories
         prev_histories = (self.cost_history, self.control_history)
         self.cost_history = append(self.cost_history, cost)
@@ -164,13 +170,14 @@ class LiftedBPC(Controller):
         self.t += 1
         histories = (self.cost_history, self.control_history)
         state = self.lifter.map(*histories)  # xhat_{t+1}
+        self.state_history = append(self.state_history, state)
         if self.t < self.T0: 
             lifter_loss = self.lifter.update(prev_histories, histories)  # update lifter, if needed
         else:
-            if self.t == self.T0: print('WARNING: note that we are only updating lifter during sysid phase')
+            if self.t == self.T0: print('WARNING ({}): note that we are only updating lifter during sysid phase'.format(self.__class__))
             lifter_loss = 0.
         
-        # 2. explore for sysid, and then get stabilizing controller
+        # 2. explore for sysid, and then maybe get stabilizing controller
         if self.t < self.T0:
             control = self.sysid.perturb_control(state)  # TODO should rescaling be applied to this?
             if self.bounds is not None: control = control.clip(*self.bounds)
@@ -178,7 +185,7 @@ class LiftedBPC(Controller):
             self.prev_control = control
             return control
         elif self.use_K_from_sysid and self.t == self.T0:  # get the K from sysid every so often
-            print('copying the K from {}'.format(self.sysid))
+            print('LOG ({}): copying the K from {}'.format(self.__class__, self.sysid))
             self.K = self.sysid.get_lqr()
             pass
     
@@ -199,9 +206,17 @@ class LiftedBPC(Controller):
         self.grads.append((grad_M, grad_M0, grad_K))
         if len(self.grads) == self.grads.maxlen and self.t % self.step_every == 0:
             grads = list(self.grads)[:self.step_every]  # use updates starting from h steps ago
-            self.M = self.M - self.M_update_rescaler.step(sum([g[0] for g in grads]), iterate=self.M)
-            self.M0 = self.M0 - self.M0_update_rescaler.step(sum([g[1] for g in grads]), iterate=self.M0)
-            self.K = self.K - self.K_update_rescaler.step(sum([g[2] for g in grads]), iterate=self.K)
+            self.M -= self.M_update_rescaler.step(sum([g[0] for g in grads]), iterate=self.M)
+            self.M0 -= self.M0_update_rescaler.step(sum([g[1] for g in grads]), iterate=self.M0)
+            self.K -= self.K_update_rescaler.step(sum([g[2] for g in grads]), iterate=self.K)
+            
+        # ensure norms are good
+        norm = jnp.linalg.norm(self.M)  
+        if norm > 1:
+           self.M /= norm
+        norm = jnp.linalg.norm(self.K)  
+        if norm > 1:
+            self.K /= norm
         
         # 5. compute newest perturbed control
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
@@ -220,7 +235,7 @@ class LiftedBPC(Controller):
         elif self.method == 'REINFORCE':  # perturb output only
             eps = sample(jkey(), (self.control_dim,))
             M0_tilde = M0_tilde + M0_scale * eps
-            if M0_scale > 0: self.eps = append(self.eps, eps / M0_scale)
+            if M0_scale > 0: self.eps = append(self.eps, eps / M0_scale ** 2)
             
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
         control = self.inv_rescale_u(-K_tilde @ state) + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
@@ -230,8 +245,10 @@ class LiftedBPC(Controller):
 
         # cache it
         self.prev_cost = cost
+        # self.prev_cost = jnp.mean(self.cost_history).item()
         self.prev_state = state
         self.prev_control = control 
+        self.cost_accum += cost
         
         # update stats
         A, B = self.sysid.sysid()
@@ -240,6 +257,7 @@ class LiftedBPC(Controller):
         self.stats.update('||B||_F', jnp.linalg.norm(B, 'fro').item(), t=self.t)
         self.stats.update('disturbances', jnp.linalg.norm(disturbance).item(), t=self.t)
         self.stats.update('costs', cost, t=self.t)
+        self.stats.update('cost diffs', cost_diff, t=self.t)
         self.stats.update('lifter losses', lifter_loss, t=self.t)
         if self.control_dim == 1:
             self.stats.update('K @ state', (-self.K @ state).item(), t=self.t)
@@ -274,7 +292,7 @@ class ConstantController(Controller):
         self.value = float(value)
         self.control_dim = control_dim
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the controller will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         pass

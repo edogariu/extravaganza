@@ -19,7 +19,7 @@ def ylim(ax, left, right):
 def run_trial(controller: Controller, 
               system: DynamicalSystem, 
               T: int, 
-              reset_every: int = None,
+              reset_condition: Callable[[int], bool] = lambda t: False,
               reset_seed: int = None,
               wordy: bool = True):
     
@@ -29,7 +29,7 @@ def run_trial(controller: Controller,
     # run trial
     pbar = tqdm.trange(T) if wordy else range(T)
     for t in pbar:
-        if reset_every is not None and t % reset_every == 0:
+        if reset_condition(t):
             print('reset!')
             system.reset(reset_seed)
             
@@ -55,7 +55,7 @@ def run_experiment(make_system: Callable[[], DynamicalSystem],
                    make_controllers: Dict[str, Callable[[DynamicalSystem], Controller]],
                    num_trials: int,
                    T: int,
-                   reset_every: int = None,
+                   reset_condition: Callable[[int], bool] = lambda t: False,
                    reset_seed: int = None,
                    wordy: bool = True):
     
@@ -68,10 +68,12 @@ def run_experiment(make_system: Callable[[], DynamicalSystem],
             if wordy: print('testing {}'.format(k))
             system = make_system()
             controller = controller_func(system)
-            s = run_trial(controller, system, T, reset_every, reset_seed, wordy=wordy)
-            stats[k].append(s)
+            s = run_trial(controller, system, T, reset_condition, reset_seed, wordy=wordy)
+            if s is not None: stats[k].append(s)
             if wordy: print()
-    
+    if len(stats) == 0: 
+        print('ERROR: none of the trials succeeded.')
+        return None
     for k in stats.keys():  # aggregate stats over the trials
         stats[k] = Stats.aggregate(stats[k])
     

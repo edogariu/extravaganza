@@ -51,7 +51,7 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
         if value is None: return
         assert key in self._stats, 'please register {} with `stats.register(\'{}\', ...)`'.format(key, key)
         stat = self._stats[key]
-        if stat.obj_class is not None: assert isinstance(value, stat.obj_class), value.__class__
+        if stat.obj_class is not None: assert isinstance(value, stat.obj_class), (key, value.__class__)
         if stat.shape is not None and isinstance(value, (np.ndarray, jnp.ndarray, torch.Tensor)): assert value.shape == stat.shape, value.shape
         if stat.plottable is not None: assert t is not None
         
@@ -108,13 +108,13 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             vs = jnp.array(agg_stat.value)
             mean, std = vs.mean(axis=0), vs.std(axis=0)
             val = (mean.squeeze(), std.squeeze(), vs)
-            aggregate_stats._stats[k].value = val
+            aggregate_stats._stats[k] = aggregate_stats._stats[k]._replace(value=val)
             
             if agg_stat.plottable:
                 ts = jnp.array(agg_stat.t)
                 ts = ts[0].reshape(*mean.shape)
                 # assert ts.std(axis=0).mean() < 1e-4, (ts, k)
-                aggregate_stats._stats[k].t = ts
+                aggregate_stats._stats[k] = aggregate_stats._stats[k]._replace(t=ts)
         
         aggregate_stats.aggregated = True
         return aggregate_stats

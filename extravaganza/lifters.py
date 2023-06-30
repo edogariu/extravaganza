@@ -160,8 +160,8 @@ class LearnedLift(Lifter, SysID):
         self.lift_opt = torch.optim.Adam(self.lift_model.parameters(), lr=lift_lr)
     
         # to estimate linear dynamics of lifted states
-        self.A = torch.nn.Parameter(0.9 * torch.eye(self.state_dim, dtype=torch.float32))  # for stability purposes :)
-        self.B = torch.nn.Parameter(0.5 * torch.randn((self.state_dim, self.control_dim), dtype=torch.float32))
+        self.A = torch.nn.Parameter(0.99 * torch.eye(self.state_dim, dtype=torch.float32))  # for stability purposes :)
+        self.B = torch.nn.Parameter(torch.zeros((self.state_dim, self.control_dim), dtype=torch.float32))
         self.sysid_opt = torch.optim.Adam([self.A, self.B], lr=sysid_lr)
         
         # to learn "inverse" of lifing function
@@ -206,7 +206,7 @@ class LearnedLift(Lifter, SysID):
         return control
     
     def train(self):
-        print('training!')
+        print('LOG ({}): training!'.format(self.__class__))
             
         # prepare dataloader
         from torch.utils.data import DataLoader, TensorDataset
@@ -238,10 +238,10 @@ class LearnedLift(Lifter, SysID):
                 self.lift_opt.zero_grad()
                 self.sysid_opt.zero_grad()
                 
-                # compute loss 
+                # compute loss
                 LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 0, 0
                 norm = torch.norm(state)
-                state_norm = (1 / (norm + 1e-8)) #+ norm if LAMBDA_STATE_NORM > 0 else 0.
+                state_norm = (1 / (norm + 1e-8)) + norm if LAMBDA_STATE_NORM > 0 else 0.
                 stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
                 loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
@@ -259,7 +259,8 @@ class LearnedLift(Lifter, SysID):
                 losses.append(loss.item())
                 
             print_every = 25
-            if t % print_every == 0 or t == self.num_epochs - 1: print('mean loss for past {} epochs was {}'.format(print_every, np.mean(losses[-print_every:])))
+            if t % print_every == 0 or t == self.num_epochs - 1: 
+                print('LOG ({}): \tmean loss for past {} epochs was {}'.format(self.__class__, print_every, np.mean(losses[-print_every:])))
             
         self.trained = True
         return losses
@@ -268,7 +269,7 @@ class LearnedLift(Lifter, SysID):
         if not self.trained:
             self.losses = self.train()
             A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
-            print('||A||_op = {}     ||B||_F {}'.format(opnorm(A), jnp.linalg.norm(B, 'fro')))
+            print('LOG ({}): ||A||_op = {}     ||B||_F {}'.format(self.__class__, opnorm(A), jnp.linalg.norm(B, 'fro')))
             return A, B
         
         A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())

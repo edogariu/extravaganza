@@ -171,7 +171,7 @@ class LinearRegression(NNTraining):
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the system will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         self.stats.register('train losses', float, plottable=True)
@@ -239,7 +239,7 @@ class MNIST(NNTraining):
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the system will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         self.stats.register('train losses', float, plottable=True)
@@ -309,8 +309,8 @@ class LDS(DynamicalSystem):
                            'constant': lambda t: 1.,
                            'gaussian': lambda t: np.random.randn() * 0.1,  # variance of 0.01
                         #    'linear': lambda t: float(t),  # this one is stupid
-                           'sinusoidal': lambda t: np.sin(2 * np.pi * t / 500),  # period of 500 steps
-                           'square wave': lambda t: np.ceil(t / 500) % 2  # period of 500 
+                           'sinusoidal': lambda t: np.sin(2 * np.pi * t / 750),  # period of 500 750
+                           'square wave': lambda t: np.ceil(t / 750) % 2  # period of 750 
                            }
         assert disturbance_type in disturbance_fns
         self.disturbance = disturbance_fns[disturbance_type]
@@ -327,8 +327,9 @@ class LDS(DynamicalSystem):
         
         # figure out stats to keep track of
         self.t = 0
+        self.episode_fs = []
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the system will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         self.stats.register('xs', jnp.ndarray, plottable=True)
@@ -336,15 +337,18 @@ class LDS(DynamicalSystem):
         # self.stats.register('ws', float, plottable=True)
         self.stats.register('fs', float, plottable=True)
         self.stats.register('avg fs', float, plottable=True)
+        self.stats.register('median fs since last reset', float, plottable=True, use_special_prefixes=False)
         
         # figure out init
         self.initial_state = jax.random.normal(jkey(), (state_dim,))
+        print('LOG ({}): initial state is {}'.format(self.__class__, self.initial_state))
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass
     
     def reset(self, seed: int = None):
         super().reset(seed)
         self.state = self.initial_state.copy()
+        self.episode_fs = []
         return self
 
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
@@ -360,10 +364,12 @@ class LDS(DynamicalSystem):
         if hasattr(cost, 'item'): cost = cost.item()
         
         # update
+        self.episode_fs.append(cost)
         self.stats.update('xs', self.state, t=self.t)
         self.stats.update('us', control, t=self.t)
         # self.stats.update('ws', disturbance, t=self.t)
         self.stats.update('fs', cost, t=self.t)
+        self.stats.update('median fs since last reset', np.median(self.episode_fs), t=self.t)
         self.state = state
         self.t += 1
         
@@ -392,24 +398,33 @@ class COCO(LDS):
         
         super().__init__(dim, dim, disturbance_type, None, A, B, R, seed, stats)    
        
-        full_x = jax.random.normal(jkey(), (self.problem.dimension,))  # handles the other coordinates
+        full_x = jax.random.normal(jkey(), (self.problem.dimension,)).clip(-5, 5)  # handles the other coordinates
+        lambda_dist = 1
         def cost_fn(x: jnp.ndarray) -> float:
-            sq_dist = jnp.sum(jnp.maximum(jnp.abs(x) - 5, 0) ** 2)  # how far past `[-5, 5]^dim` we are
-            return self.problem(full_x.at[idxs].set(x)) + 0.1 * sq_dist    
+            v = jnp.clip(x, -5, 5)
+            cost = self.problem(full_x.at[idxs].set(v))
+            sq_dist = ((x - v) ** 2).sum()  # how far past `[-5, 5]^dim` we are
+            return cost + lambda_dist * sq_dist
         self.cost_fn = lambda x, u: cost_fn(x) + u.T @ self.R @ u
         
         # find optimal control
-        _n = 10000
-        _test = np.tile(full_x, _n).reshape(_n, -1)
-        gt_xs = np.tile(np.linspace(-5, 5, _n), dim).reshape(dim, -1).T
-        _test[:, idxs] = gt_xs
-        gt_fs = [self.problem(_t) for _t in _test]
+        n = 5000
+        gt_xs = np.tile(np.linspace(-5, 5, n), dim).reshape(dim, -1).T
+        gt_fs = [self.cost_fn(x, jnp.zeros(dim)) for x in gt_xs]
         xstar = gt_xs[np.argmin(gt_fs)]
         self.stats['xstar'] = xstar
         self.stats['gt_xs'] = gt_xs
         self.stats['gt_fs'] = gt_fs
-        del _test
         pass
+    
+    def reset(self, seed: int = None):
+        set_seed(seed)
+        state = jax.random.uniform(jkey(), (self.state_dim,), minval=-5, maxval=5)
+        if hasattr(self, 'state'): print('state has been reset to {}. it was {}'.format(state, self.state))
+        self.state = state
+        # self.state = self.initial_state.copy()
+        self.episode_fs = []
+        return self
 
 
 class Gym(DynamicalSystem):
@@ -445,7 +460,7 @@ class Gym(DynamicalSystem):
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the system will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         self.stats.register('xs', float, plottable=True)
@@ -539,14 +554,16 @@ class PPOGym(DynamicalSystem):
         
         # stats to keep track of
         self.t = 0
+        self.episode_costs = []
         if stats is None:
-            print('WARNING: no `Stats` object provided, so the system will make a new one.')
+            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
             stats = Stats()
         self.stats = stats
         if self.env.observation_space.shape[0] == 1: self.stats.register('xs', float, plottable=True)
         if self.control_dim == 1: self.stats.register('us', float, plottable=True)
         self.stats.register('rewards', float, plottable=True)
         self.stats.register('avg rewards', float, plottable=True)
+        self.stats.register('avg costs since reset', float, plottable=True, use_special_prefixes=False)
         self.stats.register('lr_actor', float, plottable=True)
         self.stats.register('lr_critic', float, plottable=True)
         self.stats.register('gamma', float, plottable=True)
@@ -570,6 +587,7 @@ class PPOGym(DynamicalSystem):
         """
         set_seed(self.reset_seed)  # for reproducibility
         self.reset_env(seed)
+        self.episode_costs = []
     
         # reset models
         for model in [self.ppo.actor, self.ppo.critic]:
@@ -612,6 +630,8 @@ class PPOGym(DynamicalSystem):
         self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
         self.stats.update('gamma', self.ppo.gamma, t=self.t)
         self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
+        self.stats.update('avg costs since reset', -np.mean(self.episode_costs) if len(self.episode_costs) > 0 else 0., t=self.t)
+        self.episode_costs.append(cost)
         self.t += 1
         
         return cost, jnp.array(self.state)
