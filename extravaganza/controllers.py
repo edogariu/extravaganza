@@ -1,14 +1,14 @@
+import logging
 from abc import abstractmethod
 from typing import Tuple
-from collections import deque
+from collections import deque, defaultdict
 
 import jax.numpy as jnp
 
 from extravaganza.lifters import Lifter
 from extravaganza.sysid import SysID
 from extravaganza.stats import Stats
-from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm
-
+from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname
 
 class Controller:
     """
@@ -138,7 +138,7 @@ class LiftedBPC(Controller):
         
         # stats
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
         self.stats.register('||A-BK||_op', float, plottable=True)
@@ -174,7 +174,7 @@ class LiftedBPC(Controller):
         if self.t < self.T0: 
             lifter_loss = self.lifter.update(prev_histories, histories)  # update lifter, if needed
         else:
-            if self.t == self.T0: print('WARNING ({}): note that we are only updating lifter during sysid phase'.format(self.__class__))
+            if self.t == self.T0: logging.info('({}) Note that we are only updating lifter during sysid phase'.format(get_classname(self)))
             lifter_loss = 0.
         
         # 2. explore for sysid, and then maybe get stabilizing controller
@@ -185,7 +185,7 @@ class LiftedBPC(Controller):
             self.prev_control = control
             return control
         elif self.use_K_from_sysid and self.t == self.T0:  # get the K from sysid every so often
-            print('LOG ({}): copying the K from {}'.format(self.__class__, self.sysid))
+            logging.info('({}) copying the K from {}'.format(get_classname(self), self.sysid))
             self.K = self.sysid.get_lqr()
             pass
     
@@ -196,7 +196,7 @@ class LiftedBPC(Controller):
         
         # compute change in cost, as well as the new scale
         cost_diff = cost - self.prev_cost
-        M_scale, M0_scale, K_scale = map(lambda s: s / (self.t ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
+        M_scale, M0_scale, K_scale = map(lambda s: s / ((self.t - self.T0 + 1) ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
 
         # 4. update controller
         d = self.d_rescale_u(self.prev_control)
@@ -210,13 +210,13 @@ class LiftedBPC(Controller):
             self.M0 -= self.M0_update_rescaler.step(sum([g[1] for g in grads]), iterate=self.M0)
             self.K -= self.K_update_rescaler.step(sum([g[2] for g in grads]), iterate=self.K)
             
-        # ensure norms are good
-        norm = jnp.linalg.norm(self.M)  
-        if norm > 1:
-           self.M /= norm
-        norm = jnp.linalg.norm(self.K)  
-        if norm > 1:
-            self.K /= norm
+        # # ensure norms are good
+        # norm = jnp.linalg.norm(self.M)  
+        # if norm > 1:
+        #    self.M /= norm
+        # norm = jnp.linalg.norm(self.K)  
+        # if norm > 1:
+        #     self.K /= norm
         
         # 5. compute newest perturbed control
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
@@ -235,7 +235,7 @@ class LiftedBPC(Controller):
         elif self.method == 'REINFORCE':  # perturb output only
             eps = sample(jkey(), (self.control_dim,))
             M0_tilde = M0_tilde + M0_scale * eps
-            if M0_scale > 0: self.eps = append(self.eps, eps / M0_scale ** 2)
+            if M0_scale > 0: self.eps = append(self.eps, eps)
             
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
         control = self.inv_rescale_u(-K_tilde @ state) + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
@@ -244,8 +244,8 @@ class LiftedBPC(Controller):
 #         control = self.sysid.perturb_control(state, control=control)  # perturb for sysid purposes later than T0?
 
         # cache it
-        self.prev_cost = cost
-        # self.prev_cost = jnp.mean(self.cost_history).item()
+        # self.prev_cost = cost
+        self.prev_cost = jnp.mean(self.cost_history).item()
         self.prev_state = state
         self.prev_control = control 
         self.cost_accum += cost
@@ -292,7 +292,7 @@ class ConstantController(Controller):
         self.value = float(value)
         self.control_dim = control_dim
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
         pass
@@ -311,6 +311,42 @@ class LQR(_LQR):
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         return self(state)
+    
+class HINF(Controller):
+    def __init__(self, 
+                 A: jnp.ndarray,
+                 B: jnp.ndarray,
+                 Q: jnp.ndarray = None,
+                 R: jnp.ndarray = None,
+                 T: int = 100,
+                 gamma: float = 10,
+                 seed: int = None):
+
+        set_seed(seed)
+        dx, du = B.shape
+        if Q is None: Q = jnp.identity(dx, dtype=jnp.float32)
+        if R is None: R = jnp.identity(du, dtype=jnp.float32)
+        P, K = [jnp.zeros((dx, dx)) for _ in range(T + 1)], [jnp.zeros((du, dx)) for _ in range(T)], 
+        P[T] = Q
+        for t in range(T - 1, -1, -1):
+            Lambda = jnp.eye(dx) + (B @ jnp.linalg.inv(R) @ B.T - gamma ** -2 * jnp.eye(dx)) @ P[t + 1]
+            P[t] = Q + A.T @ P[t + 1] @ jnp.linalg.pinv(Lambda) @ A
+            K[t] = -jnp.linalg.inv(R) @ B.T @ P[t + 1] @ jnp.linalg.pinv(Lambda) @ A
+        
+        self.state_dim = dx
+        self.control_dim = du
+        self.K = K
+        self.t = 0
+        self.stats = Stats()
+        pass
+    
+    def get_control(self, 
+                    cost: float, 
+                    state: jnp.ndarray) -> jnp.ndarray:
+        assert state.shape == (self.state_dim,)
+        ret = self.K[min(self.t, len(self.K) - 1)] @ state
+        self.t += 1
+        return ret
     
 class GPC(_GPC):
     def __init__(self, *args, **kwargs):
@@ -422,3 +458,193 @@ class RBPC(Controller):  # from Udaya
         return self.act(state, cost)
     
 # ----------------------------------------------------------------------------------------
+
+class PID(Controller):
+    def __init__(self, 
+                 control_dim: int, 
+                 setpoint: jnp.ndarray,
+                 obs_mask: jnp.ndarray,
+                 Kp: jnp.ndarray = None, 
+                 Ki: jnp.ndarray = None, 
+                 Kd: jnp.ndarray = None, 
+                 stats: Stats = None):
+        
+        obs_dim = int(sum(obs_mask))
+        if isinstance(setpoint, float): setpoint = jnp.array([setpoint])
+        assert setpoint.shape == (obs_dim,)
+        
+        self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, obs_dim) if t is not None else jnp.zeros((control_dim, obs_dim)), 
+                                        [Kp, Ki, Kd])
+        self.obs_dim = obs_dim
+        self.control_dim = control_dim
+        self.setpoint = setpoint
+        self.obs_idxs = jnp.where(jnp.array(obs_mask) == 1)[0]
+        
+        self.p = jnp.zeros(self.obs_dim)  # keep track of current error
+        self.i = jnp.zeros(self.obs_dim)  # keep track of accumulated error
+
+        self.t = 0
+        if stats is None:
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
+            stats = Stats()
+        self.stats = stats
+        if obs_dim == 1:
+            self.stats.register('Kp', float, plottable=True)
+            self.stats.register('Ki', float, plottable=True)
+            self.stats.register('Kd', float, plottable=True)
+            self.stats.register('P', float, plottable=True)
+            self.stats.register('I', float, plottable=True)
+            self.stats.register('D', float, plottable=True)
+        pass
+    
+    def reset(self, seed: int = None):
+        set_seed(seed)  # for reproducibility
+
+        self.p = jnp.zeros(self.obs_dim)
+        self.i = jnp.zeros(self.obs_dim)
+        return self
+    
+    def get_control(self, 
+                    cost: float, 
+                    state: jnp.ndarray) -> jnp.ndarray:
+        state = jnp.take(state, self.obs_idxs)
+        assert state.shape == (self.obs_dim,), state.shape
+        
+        error = state - self.setpoint
+        
+        p, i, d = self.p, self.i, error - self.p
+        control = self.Kp @ p + self.Ki @ i + self.Kd @ d
+        
+        self.p = error
+        self.i += error
+        self.t += 1
+        
+        if self.obs_dim == 1:
+            self.stats.update('Kp', self.Kp.item(), t=self.t)
+            self.stats.update('Ki', self.Ki.item(), t=self.t)
+            self.stats.update('Kd', self.Kd.item(), t=self.t)
+            self.stats.update('P', p.item(), t=self.t)
+            self.stats.update('I', i.item(), t=self.t)
+            self.stats.update('D', d.item(), t=self.t)
+        return control
+
+"""
+Regular clipped PPO implementation, with no target networks, no delayed updates, and no experience replay.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+class PPO(Controller):
+    def __init__(self,
+                 state_dim: int, 
+                 control_dim: int,  # n_actions if discrete
+                 lr_actor: float, 
+                 lr_critic: float, 
+                 gamma: float, 
+                 eps_clip: float, 
+                 has_continuous_action_space: bool,
+                 stats: Stats = None):
+        self.state_dim = state_dim
+        self.action_dim = control_dim
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.continuous_action_space = has_continuous_action_space
+        
+        # models and opts
+        self.actor = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, self.action_dim),
+            nn.Softmax(dim=-1) if not has_continuous_action_space else nn.Identity()
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
+        )
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
+        
+        # things to keep track of
+        self.prob_act = None
+        self.state = None
+        self.cost = None
+        
+        self.t = 0
+        if stats is None:
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
+            stats = Stats()
+        self.stats = stats
+        self.stats.register('lr_actor', float, plottable=True)
+        self.stats.register('lr_critic', float, plottable=True)
+        self.stats.register('gamma', float, plottable=True)
+        self.stats.register('eps_clip', float, plottable=True)
+        pass
+    
+    def reset(self, seed: int = None):
+        set_seed(seed)  # for reproducibility
+        self.prob_act = None
+        self.state = None
+        self.cost = None
+
+        # reset models
+        for model in [self.actor, self.critic]:
+            for layer in model.modules():
+                if hasattr(layer, 'reset_parameters'):
+                    layer.reset_parameters()
+            model.train()
+        for opt in [self.actor_opt, self.critic_opt]:
+            opt.__setstate__({'state': defaultdict(dict)}) 
+        return self
+    
+    def policy_loss(self, old_log_prob, log_prob, advantage, eps):
+        ratio = (log_prob - old_log_prob).exp()
+        clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
+        m = torch.min(ratio * advantage, clipped * advantage)
+        return -m
+    
+    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+        
+        # compute next action
+        if state != 'done':
+            state = torch.from_numpy(np.array(state))
+            done = False
+        else:
+            state = torch.zeros(self.state_dim)
+            done = True
+        probs = self.actor(state)
+        dist = torch.distributions.Categorical(probs=probs)
+        action = dist.sample()
+        prob_act = dist.log_prob(action)
+        
+        # update
+        if self.prob_act is not None:
+            reward = self.cost - cost  # because `cost = -\sum_i reward_i`
+            advantage = reward + (1 - done) * self.gamma * self.critic(state) - self.critic(torch.from_numpy(self.state))
+            
+            actor_loss = self.policy_loss(self.prob_act.detach(), prob_act, advantage.detach(), self.eps_clip)
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            critic_loss = advantage.pow(2).mean()
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            self.critic_opt.step()
+        
+        self.state = state
+        self.prob_act = prob_act
+        self.cost = cost
+        
+        self.t += 1
+        self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('gamma', self.ppo.gamma, t=self.t)
+        self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
+        
+        return jnp.array(action.detach().data.numpy())
+    

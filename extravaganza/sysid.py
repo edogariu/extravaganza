@@ -1,7 +1,9 @@
+import logging
+
 import numpy as np
 import jax.numpy as jnp
 
-from extravaganza.utils import sample, set_seed, jkey, least_squares, opnorm, dare_gain
+from extravaganza.utils import sample, set_seed, jkey, least_squares, opnorm, dare_gain, get_classname
 
 class SysID:
     """
@@ -79,7 +81,7 @@ class SysID:
             controls = np.array(self.control_history)
 
             # regression on A and B jointly
-            A, B = least_squares(states, controls, max_opnorm=1.)
+            A, B = least_squares(states, controls, max_opnorm=None)
                 
         self.A, self.B = A, B
         return A, B
@@ -98,15 +100,15 @@ class SysID:
         A, B = self.sysid()  # make sure we have an estimate first
             
         # compute stabilizing controller for squared costs
-        Q = jnp.eye(self.state_dim); print('solving DARE with unconstrained Q')
-        # Q = jnp.zeros((self.state_dim, self.state_dim)).at[-1, -1].set(1.); print('solving DARE with constrained Q')
+        Q = jnp.eye(self.state_dim); logging.info('({}) solving DARE with unconstrained Q'.format(get_classname(self)))
+        # Q = jnp.zeros((self.state_dim, self.state_dim)).at[-1, -1].set(1.); logging.info('({}) solving DARE with CONSTRAINED Q'.format(get_classname(self)))
         R = jnp.eye(self.control_dim)  # heuristic to weight state vs control
         
         try:  # TODO check here whether `K` stabilizes our system or not
             K = dare_gain(A, B, Q, R)  # solve the ricatti equation to compute LQR gain
-            print('||A||_op = {}     ||B||_F {}         ||A-BK||_op = {}'.format(opnorm(A), jnp.linalg.norm(B, 'fro'), opnorm(A - B @ K)))
+            logging.info('({}) ||A||_op = {}     ||B||_F {}         ||A-BK||_op = {}'.format(get_classname(self), opnorm(A), jnp.linalg.norm(B, 'fro'), opnorm(A - B @ K)))
         except Exception as e:
-            print('WARNING: K diverged', e)
+            logging.error('({}) K diverged with error {}'.format(get_classname(self), e))
             K = jnp.zeros((self.control_dim, self.state_dim))
 
         return K

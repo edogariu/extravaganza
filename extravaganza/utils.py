@@ -1,3 +1,4 @@
+import logging
 import random
 import scipy.optimize as optimize
 from scipy.linalg import solve_discrete_are
@@ -8,8 +9,99 @@ import torch
 import torch.nn as nn
 import gymnasium as gym
 
-SAMPLING_METHOD = 'ball'
+# for rendering
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+COLORS = {
+          # baselines for LQR
+          'LQR': 'b',
+          'HINF': 'purple',
+          'GPC': 'orange',
+          'BPC': 'g',
+          'RBPC': 'r',
+          
+          # general baselines
+          'Zero': 'b',
+          'Constant': 'purple',
+          
+          # our methods
+          'No Lift': 'm',
+          'Random Lift': 'k',
+          'Learned Lift': 'c'}
+
+SAMPLING_METHOD = 'ball'  # must be in `['ball', 'sphere', 'rademacher']``
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def render(experiment, xkey, ykey, sliderkey: str = None, save_path: str = None, duration: float = 5, fps: int = 30):
+    assert experiment.stats is not None, 'cannot plot the results of an experiment that hasnt been run'
+    all_stats = experiment.stats
+    
+    logging.info('(RENDERER): rendering the stats of the following: {}'.format(list(all_stats.keys())))
+    ncols = 2 if sliderkey is not None else 1
+    fig, ax = plt.subplots(1, ncols, figsize=(3 * ncols, 6))
+    if sliderkey is not None:
+        slider = (ax[1], sliderkey)
+        ax = ax[0]
+    else: slider = None
+    init_fns = []
+    render_fns = []
+    num_frames = duration * fps
+    for k, s in all_stats.items():
+        init_fn, render_fn = s.get_render_fns(ax, xkey, ykey, label=k, slider=slider, num_frames=num_frames)
+        init_fns.append(init_fn)
+        render_fns.append(render_fn)
+    def init_render():
+        objs = []
+        for fn in init_fns: objs.extend(fn())
+        return objs
+    def render(i):
+        objs = []
+        for fn in render_fns: objs.extend(fn(i))
+        return objs
+    _ax = ax; _ax.legend(); _ax.set_xlabel(xkey); _ax.set_ylabel(ykey)
+    if sliderkey is not None: _ax = slider[0]; _ax.legend(); _ax.set_xlabel('timestep (t)'); _ax.set_ylabel(sliderkey)
+    anim = animation.FuncAnimation(fig, render, init_func=init_render, frames=num_frames, interval=1000 / fps)
+    if save_path is not None:
+        anim.save(save_path, writer=animation.FFMpegWriter(fps=fps))  # saving to mp4 using ffmpeg writer
+        logging.info('(RENDERER): saved rendering to `{}`'.format(save_path))
+    plt.close(fig)
+    return anim
+
+def ylim(ax, left, right):
+    _l, _r = ax.get_ylim()
+    l = max(_l, left)
+    r = min(_r, right)
+    ax.set_ylim(l, r)
+    return ax
+
+def get_color(method: str):
+    if method is None or method not in COLORS:
+        logging.warning('(UTILS): no hardcoded color for `{}`. using a random one :)'.format(method))
+        color = None
+    else:
+        color = COLORS[method]
+    return color
+
+def rescale_ax(ax, x, y, margin = 0.08, ignore_current_lims: bool = False):
+    if ignore_current_lims:
+        xl, xr = x, x
+        yl, yr = y, y
+    else:
+        xl, xr = ax.get_xlim()
+        yl, yr = ax.get_ylim()
+    xh, yh = (xl + xr) / 2, (yl + yr) / 2
+    xv = margin * abs(x - xh)
+    yv = margin * abs(y - yh)
+    xl, xr = min(xl, x - xv), max(xr, x + xv)
+    yl, yr = min(yl, y - yv), max(yr, y + yv)
+    ax.set_xlim(xl, xr + 1e-8)
+    ax.set_ylim(yl, yr + 1e-8)
+    return ax
+    
+
+def get_classname(obj):
+    return str(obj.__class__).split('.')[-1].upper()[:-2]
 
 def opnorm(X):
     if isinstance(X, torch.Tensor):
@@ -53,7 +145,7 @@ def least_squares(xs: np.ndarray,
         A_B = np.linalg.lstsq(np.hstack((x_in, u_in)), x_out, rcond=-1)[0]
         A, B = A_B[:ds].T, A_B[ds:].T
     else:
-        print('constraining operator norm of `A` to be <= {}'.format(max_opnorm))
+        logging.info('(UTILS) constraining operator norm of `A` to be <= {}'.format(max_opnorm))
         A_B_shape = (ds, ds + du)
         def A_opnorm(t):
             A = t.reshape(*A_B_shape)[:, :ds]  # only grab A
@@ -98,13 +190,18 @@ class _JKey:
         return key
     
 jkey = _JKey()
-random_numbers = np.random.randint(10000, size=(10000,))
-random_idx = 0
+random_numbers = list(np.random.randint(10000, size=(10000,)))
 
-def set_seed(seed: int = None):
-    global random_numbers, random_idx
+def set_seed(seed: int = None, meta_seed: int = None):
+    global random_numbers
+    if meta_seed is not None or len(random_numbers) == 1:
+        if meta_seed is not None:
+            np.random.seed(meta_seed)
+            logging.debug('(UTILS) set meta seed to {}'.format(meta_seed))
+        random_numbers = list(np.random.randint(10000, size=(10000,)))
     if seed is None:
-        seed = random_numbers[random_idx % len(random_numbers)]; random_idx += 1
+        seed = random_numbers.pop()
+    logging.debug('(UTILS) set seed to {}'.format(seed))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -477,75 +574,3 @@ Any further steps are undefined behavior.
         if self.viewer:
             self.viewer.close()
             
-            
-"""
-Regular clipped PPO implementation, with no target networks, no delayed updates, and no experience replay.
-"""
-class PPO:
-    def __init__(self,
-                 state_dim, 
-                 action_dim,  # n_actions if discrete
-                 lr_actor, 
-                 lr_critic, 
-                 gamma, 
-                 eps_clip, 
-                 has_continuous_action_space):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.continuous_action_space = has_continuous_action_space
-        
-        # models and opts
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, action_dim),
-            nn.Softmax(dim=-1) if not has_continuous_action_space else nn.Identity()
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, 1)
-        )
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
-        pass
-    
-    def clip_grad_norm_(self, module, max_grad_norm):
-        torch.nn.utils.clip_grad_norm_([p for g in module.param_groups for p in g["params"]], max_grad_norm)
-
-    def policy_loss(self, old_log_prob, log_prob, advantage, eps):
-        ratio = (log_prob - old_log_prob).exp()
-        clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
-        m = torch.min(ratio * advantage, clipped * advantage)
-        return -m
-    
-    def update_step(self, env, state, prev_prob_act):
-        probs = self.actor(torch.from_numpy(state))
-        dist = torch.distributions.Categorical(probs=probs)
-        action = dist.sample()
-        prob_act = dist.log_prob(action)
-
-        next_state, reward, done, _, _ = env.step(action.detach().data.numpy())
-        advantage = reward + (1 - done) * self.gamma * self.critic(torch.from_numpy(next_state)) - self.critic(torch.from_numpy(state))
-
-        if prev_prob_act is not None:
-            actor_loss = self.policy_loss(prev_prob_act.detach(), prob_act, advantage.detach(), self.eps_clip)
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
-#                 self.clip_grad_norm_(adam_actor, max_grad_norm)
-            self.actor_opt.step()
-
-            critic_loss = advantage.pow(2).mean()
-            self.critic_opt.zero_grad()
-            critic_loss.backward()
-#                 self.clip_grad_norm_(adam_critic, max_grad_norm)
-            self.critic_opt.step()
-    
-        return next_state, prob_act, done, reward, action
-    

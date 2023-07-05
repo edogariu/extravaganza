@@ -1,3 +1,4 @@
+import logging
 from abc import abstractmethod
 from typing import Callable, Tuple, Union, Iterator
 from collections import defaultdict
@@ -15,10 +16,12 @@ import jax.numpy as jnp
 
 import gymnasium as gym
 
+from extravaganza.controllers import PID, PPO
 from extravaganza.models import MLP, CNN
 from extravaganza.stats import Stats
-from extravaganza.utils import device, set_seed, jkey, sample, ContinuousCartPoleEnv, PPO
+from extravaganza.utils import device, set_seed, jkey, sample, get_classname, ContinuousCartPoleEnv, PPO
         
+                
 class DynamicalSystem:
     
     @abstractmethod
@@ -171,7 +174,7 @@ class LinearRegression(NNTraining):
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
         self.stats.register('train losses', float, plottable=True)
@@ -239,7 +242,7 @@ class MNIST(NNTraining):
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(str(self.__class__).split('.')[-1]))
             stats = Stats()
         self.stats = stats
         self.stats.register('train losses', float, plottable=True)
@@ -329,7 +332,7 @@ class LDS(DynamicalSystem):
         self.t = 0
         self.episode_fs = []
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
         self.stats.register('xs', jnp.ndarray, plottable=True)
@@ -337,11 +340,11 @@ class LDS(DynamicalSystem):
         # self.stats.register('ws', float, plottable=True)
         self.stats.register('fs', float, plottable=True)
         self.stats.register('avg fs', float, plottable=True)
-        self.stats.register('median fs since last reset', float, plottable=True, use_special_prefixes=False)
+        self.stats.register('avg fs since last reset', float, plottable=True, use_special_prefixes=False)
         
         # figure out init
         self.initial_state = jax.random.normal(jkey(), (state_dim,))
-        print('LOG ({}): initial state is {}'.format(self.__class__, self.initial_state))
+        logging.info('({}): initial state is {}'.format(get_classname(self), self.initial_state))
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass
     
@@ -369,7 +372,7 @@ class LDS(DynamicalSystem):
         self.stats.update('us', control, t=self.t)
         # self.stats.update('ws', disturbance, t=self.t)
         self.stats.update('fs', cost, t=self.t)
-        self.stats.update('median fs since last reset', np.median(self.episode_fs), t=self.t)
+        self.stats.update('avg fs since last reset', np.mean(self.episode_fs), t=self.t)
         self.state = state
         self.t += 1
         
@@ -420,7 +423,7 @@ class COCO(LDS):
     def reset(self, seed: int = None):
         set_seed(seed)
         state = jax.random.uniform(jkey(), (self.state_dim,), minval=-5, maxval=5)
-        if hasattr(self, 'state'): print('state has been reset to {}. it was {}'.format(state, self.state))
+        if hasattr(self, 'state'): logging.info('({}) state has been reset to {}. it was {}'.format(get_classname(self), state, self.state))
         self.state = state
         # self.state = self.initial_state.copy()
         self.episode_fs = []
@@ -429,42 +432,43 @@ class COCO(LDS):
 
 class Gym(DynamicalSystem):
     def __init__(self, 
-                 env: str | gym.Env,
+                 env_name: str,
+                 use_reward_costs: bool = False,
                  repeat: int = 1,
                  render: bool = False,
+                 max_episode_len: int = None,
                  seed: int = None,
                  stats: Stats = None):
 
         set_seed(seed)  # for reproducibility
         self.repeat = repeat
         self.render = render
+        self.use_reward_costs = use_reward_costs
+        self.max_episode_len = max_episode_len
         self.reset_seed = seed
         
         # env
-        if isinstance(env, gym.Env): self.env = env
-        elif isinstance(env, str):
-            if env == 'CartPoleContinuous-v1':
-                self.env = ContinuousCartPoleEnv()
-                if render: print('WARNING: i havent yet set up rendering for continuous cartpole :)')
-            else: self.env = gym.make(env, render_mode='human' if render else None)
-        else: raise Exception(env.__class__)
+        if env_name == 'CartPoleContinuous-v1':
+            self.env = ContinuousCartPoleEnv()
+            if render: logging.warning('({}) i havent yet set up rendering for continuous cartpole :)'.format(get_classname(self)))
+        else: self.env = gym.make(env_name, render_mode='human' if render else None)
+        self.state_dim = self.env.observation_space.shape[0]
         self.control_dim = self.env.action_space.shape[0]
         
-        if isinstance(env, str):
-            if env == 'MountainCarContinuous-v0': self.cost_fn = lambda state: max(0., 0.45 - state[0].item())
-            elif env == 'CartPoleContinuous-v1': self.cost_fn = lambda state: state[2].item() ** 2  # sq norm of angle
-            else: raise NotImplementedError(env)
+        if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda obs: abs(0.45 - obs.item())  # L1 distance from flag
+        elif env_name == 'CartPoleContinuous-v1': self.cost_fn = lambda obs: obs.item() ** 2  # MSE of pole angle
+        else: raise NotImplementedError(env_name)
         self.initial_state, _ = self.env.reset()
         self.reset(self.reset_seed)
         
         # stats to keep track of
         self.t = 0
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('xs', float, plottable=True)
-        self.stats.register('us', float, plottable=True)
+        if self.state_dim == 1: self.stats.register('xs', float, plottable=True)
+        if self.control_dim == 1: self.stats.register('us', float, plottable=True)
         self.stats.register('fs', float, plottable=True)
         self.stats.register('avg fs', float, plottable=True)
         self.stats.register('rewards', float, plottable=True)
@@ -477,6 +481,7 @@ class Gym(DynamicalSystem):
         """
         set_seed(seed)  # for reproducibility
         self.episode_reward = 0.
+        self.episode_t = 0
         self.done = False
         self.state, _ = self.env.reset()
         return self
@@ -491,20 +496,118 @@ class Gym(DynamicalSystem):
         
         c = np.array(control)
         for _ in range(self.repeat):
+            if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
+            if self.done: break
             self.state, r, self.done, _, _ = self.env.step(c)
             self.episode_reward += r
-            if self.done: break
-        cost = self.cost_fn(self.state)
+            self.episode_t += 1
+        cost = -self.episode_reward if self.use_reward_costs else self.cost_fn(self.state)
 
         # update
-        self.stats.update('xs', self.state[2].item(), t=self.t)
-        self.stats.update('us', control.item(), t=self.t)
-        # self.stats.update('ws', disturbance, t=self.t)
+        if self.state_dim == 1: self.stats.update('xs', self.state.item(), t=self.t)
+        if self.control_dim == 1: self.stats.update('us', control.item(), t=self.t)
         self.stats.update('fs', cost, t=self.t)
         self.stats.update('rewards', self.episode_reward, t=self.t)
         self.t += 1
         
-        return cost, jnp.array(self.state)
+        return cost, jnp.array(self.state) if not self.done else 'done'
+        
+
+class PIDGym(DynamicalSystem):
+    def __init__(self, 
+                 env_name: str,
+                 apply_control: Callable[[jnp.ndarray, DynamicalSystem], None],
+                 control_dim: int,
+                 repeat: int = 1,
+                 gym_repeat: int = 1,
+                 max_episode_len: int = None,
+                 Kp: jnp.ndarray = None, 
+                 Ki: jnp.ndarray = None, 
+                 Kd: jnp.ndarray = None, 
+                 seed: int = None,
+                 stats: Stats = None):
+        
+        self.apply_control = apply_control
+        self.control_dim = control_dim
+        self.repeat = repeat
+        self.seed = seed
+        
+        # env
+        gym_args = {
+            'env_name': env_name,
+            'use_reward_costs': True,
+            'repeat': gym_repeat,
+            'render': False,
+            'max_episode_len': max_episode_len,
+            'seed': seed,
+            'stats': stats,
+        }
+        self.gym = Gym(**gym_args)
+        self.stats = self.gym.stats
+        if env_name == 'MountainCarContinuous-v0': 
+            setpoint = 0.45
+            obs_mask = [1, 0]  # gets x position
+        elif env_name == 'CartPoleContinuous-v1': 
+            setpoint = 0.
+            obs_mask = [0, 0, 1, 0]  # gets pole angle
+        else: raise NotImplementedError(env_name)
+        
+        # alg 
+        pid_args = {
+            'control_dim': self.control_dim,
+            'setpoint': setpoint,
+            'obs_mask': obs_mask,
+            'Kp': Kp, 'Ki': Ki, 'Kd': Kd,
+            'stats': self.stats
+        }
+        self.pid = PID(**pid_args)
+        self.reset(seed)
+        
+        # stats to keep track of
+        self.t = 0
+        self.episode_rewards = []
+        self.stats.register('avg rewards since reset', float, plottable=True, use_special_prefixes=False)
+        pass
+
+    def reset(self, seed: int = None):
+        """
+        to reset an episode, which should send state back to init
+        """
+        # for reproducibility
+        self.gym.reset(seed)
+        self.episode_rewards = []
+        self.state = None
+    
+        # reset controller history
+        self.pid.reset(seed)
+        return self
+
+    def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
+        """
+        given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
+        """
+        assert control.shape == (self.control_dim,)
+            
+        # apply control
+        self.apply_control(control, self)
+        for _ in range(self.repeat):
+            action = self.pid.get_control(None, self.state) if self.state is not None else self.gym.env.action_space.sample()
+            action = jnp.clip(action, self.gym.env.action_space.low, self.gym.env.action_space.high)
+            
+            cost, state = self.gym.interact(action)
+            if state == 'done':
+                self.state = None
+                self.pid.reset(self.seed)
+                break
+            else:
+                self.state = state
+        
+        # update stats
+        self.stats.update('avg rewards since reset', np.mean(self.episode_rewards) if len(self.episode_rewards) > 0 else 0., t=self.t)
+        self.episode_rewards.append(-cost)
+        self.t += 1
+        
+        return cost, None
         
         
 class PPOGym(DynamicalSystem):
@@ -512,13 +615,12 @@ class PPOGym(DynamicalSystem):
                  env_name: str,
                  apply_control: Callable[[jnp.ndarray, DynamicalSystem], None],
                  control_dim: int,
-                 continuous_action_space: bool = True,
                  lr_actor: float = 0.0003,
                  lr_critic: float = 0.001,
                  eps_clip: float = 0.2,
                  gamma: float = 0.99,
                  repeat: int = 1,
-                 render: bool = False,
+                 gym_repeat: int = 1,
                  max_episode_len: int = None,
                  seed: int = None,
                  stats: Stats = None):
@@ -527,36 +629,40 @@ class PPOGym(DynamicalSystem):
         
         self.apply_control = apply_control
         self.repeat = repeat
-        self.render = render
-        self.reset_seed = seed
         self.control_dim = control_dim
+        self.seed = seed
         
         # env
-        self.env = gym.make(env_name, render_mode='human' if render else None)
-        self.initial_state, _ = self.env.reset()
-        self.continuous_action_space = continuous_action_space
-        self.action_dim = self.env.action_space.shape[0] if continuous_action_space else self.env.action_space.n
-        self.max_episode_len = max_episode_len
+        gym_args = {
+            'env_name': env_name,
+            'use_reward_costs': True,
+            'repeat': gym_repeat,
+            'render': False,
+            'max_episode_len': max_episode_len,
+            'seed': seed,
+            'stats': stats,
+        }
+        self.gym = Gym(**gym_args)
+        self.stats = self.gym.stats
         
         # alg
         ppo_args = {
             'state_dim': self.env.observation_space.shape[0],
-            'action_dim': self.action_dim,
+            'action_dim': self.gym.control_dim,
             'lr_actor': lr_actor,
             'lr_critic': lr_critic,
             'gamma': gamma,
             'eps_clip': eps_clip,
-            'has_continuous_action_space': continuous_action_space,
+            'has_continuous_action_space': 'continuous' in env_name.lower(),
         }
         self.ppo = PPO(**ppo_args)
-        
-        self.reset(self.reset_seed)
+        self.reset(self.seed)
         
         # stats to keep track of
         self.t = 0
         self.episode_costs = []
         if stats is None:
-            print('WARNING ({}): no `Stats` object provided, so a new one will be made.'.format(self.__class__))
+            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
         if self.env.observation_space.shape[0] == 1: self.stats.register('xs', float, plottable=True)
@@ -569,70 +675,81 @@ class PPOGym(DynamicalSystem):
         self.stats.register('gamma', float, plottable=True)
         self.stats.register('eps_clip', float, plottable=True)
         pass
-        
-    def reset_env(self, seed: int = None):
-        set_seed(seed)  # for reproducibility
-        self.done = False
-        self.episode_reward = 0.
-        self.episode_t = 0
-        self.prob_act = None
-        
-        # reset env
-        self.state, _ = self.env.reset()
-        pass
     
     def reset(self, seed: int = None):
         """
         to reset an episode, which should send state back to init
         """
-        set_seed(self.reset_seed)  # for reproducibility
-        self.reset_env(seed)
-        self.episode_costs = []
-    
-        # reset models
-        for model in [self.ppo.actor, self.ppo.critic]:
-            for layer in model.modules():
-                if hasattr(layer, 'reset_parameters'):
-                    layer.reset_parameters()
-            model.train()
-        for opt in [self.ppo.actor_opt, self.ppo.critic_opt]:
-            opt.__setstate__({'state': defaultdict(dict)}) 
-        
+        # for reproducibility
+        self.gym.reset(seed)
+        self.episode_rewards = []
+
+        # reset controller history
+        self.ppo.reset(seed)
         return self
     
-
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
         """
         given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
         """
         assert control.shape == (self.control_dim,)
-
-        if self.done:
-            self.reset_env(self.reset_seed)
-            pass
             
         # apply control
         self.apply_control(control, self)
         for _ in range(self.repeat):
-            if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
-            if self.done: break
-            self.state, self.prob_act, self.done, reward, action = self.ppo.update_step(self.env, self.state, self.prob_act)
-            self.episode_reward += reward
-            self.episode_t += 1
-    
-        cost = -self.episode_reward
+            action = self.ppo.get_control(cost, self.state) if self.state is not None else self.gym.env.action_space.sample()
+            action = jnp.clip(action, self.gym.env.action_space.low, self.gym.env.action_space.high)
+            
+            cost, state = self.gym.interact(action)
+            if state == 'done':
+                self.state = None
+                self.ppo.reset(self.seed)
+                break
+            else:
+                self.state = state
         
         # update stats
-        if self.env.observation_space.shape[0] == 1: self.stats.update('xs', float(self.state[0]), t=self.t)
-        if self.control_dim == 1: self.stats.update('us', float(action[0] if self.continuous_action_space else action), t=self.t)
-        self.stats.update('rewards', self.episode_reward, t=self.t)
+        self.stats.update('avg rewards since reset', np.mean(self.episode_rewards) if len(self.episode_rewards) > 0 else 0., t=self.t)
         self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
         self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
         self.stats.update('gamma', self.ppo.gamma, t=self.t)
         self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
-        self.stats.update('avg costs since reset', -np.mean(self.episode_costs) if len(self.episode_costs) > 0 else 0., t=self.t)
-        self.episode_costs.append(cost)
+        self.episode_rewards.append(-cost)
         self.t += 1
         
-        return cost, jnp.array(self.state)
+        return cost, None
+    
+
+    # def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
+    #     """
+    #     given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
+    #     """
+    #     assert control.shape == (self.control_dim,)
+
+    #     if self.done: self.reset_env(self.reset_seed)
+            
+    #     # apply control
+    #     self.apply_control(control, self)
+    #     for _ in range(self.repeat):
+    #         if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
+    #         if self.done: break
+    #         self.state, self.prob_act, self.done, reward, action = self.ppo.update_step(self.env, self.state, self.prob_act)
+    #         self.episode_reward += reward
+    #         self.episode_t += 1
+    
+    #     cost = -self.episode_reward
+        
+    #     # update stats
+    #     if self.env.observation_space.shape[0] == 1: self.stats.update('xs', float(self.state[0]), t=self.t)
+    #     if self.control_dim == 1: self.stats.update('us', float(action[0] if self.continuous_action_space else action), t=self.t)
+    #     self.stats.update('rewards', self.episode_reward, t=self.t)
+    #     self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
+    #     self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
+    #     self.stats.update('gamma', self.ppo.gamma, t=self.t)
+    #     self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
+    #     self.stats.update('avg costs since reset', -np.mean(self.episode_costs) if len(self.episode_costs) > 0 else 0., t=self.t)
+    #     self.episode_costs.append(cost)
+    #     self.t += 1
+        
+    #     return cost, jnp.array(self.state)
     

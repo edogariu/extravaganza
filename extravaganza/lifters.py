@@ -1,3 +1,4 @@
+import logging
 from abc import abstractmethod
 import inspect
 from typing import Tuple
@@ -8,7 +9,7 @@ import jax.numpy as jnp
 
 from extravaganza.models import MLP
 from extravaganza.sysid import SysID
-from extravaganza.utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain
+from extravaganza.utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain, get_classname
 
 class Lifter:
     """
@@ -206,7 +207,7 @@ class LearnedLift(Lifter, SysID):
         return control
     
     def train(self):
-        print('LOG ({}): training!'.format(self.__class__))
+        logging.info('({}): training!'.format(get_classname(self)))
             
         # prepare dataloader
         from torch.utils.data import DataLoader, TensorDataset
@@ -239,10 +240,10 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 0, 0
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-6, 0, 1e-5
                 norm = torch.norm(state)
                 state_norm = (1 / (norm + 1e-8)) + norm if LAMBDA_STATE_NORM > 0 else 0.
-                stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
+                stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) / opnorm(self.A) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
                 loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
                 loss.backward()
@@ -260,7 +261,7 @@ class LearnedLift(Lifter, SysID):
                 
             print_every = 25
             if t % print_every == 0 or t == self.num_epochs - 1: 
-                print('LOG ({}): \tmean loss for past {} epochs was {}'.format(self.__class__, print_every, np.mean(losses[-print_every:])))
+                logging.info('({}) \tmean loss for past {} epochs was {}'.format(get_classname(self), print_every, np.mean(losses[-print_every:])))
             
         self.trained = True
         return losses
@@ -269,7 +270,7 @@ class LearnedLift(Lifter, SysID):
         if not self.trained:
             self.losses = self.train()
             A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
-            print('LOG ({}): ||A||_op = {}     ||B||_F {}'.format(self.__class__, opnorm(A), jnp.linalg.norm(B, 'fro')))
+            logging.info('({}) ||A||_op = {}     ||B||_F {}'.format(get_classname(self), opnorm(A), jnp.linalg.norm(B, 'fro')))
             return A, B
         
         A, B = jnp.array(self.A.data.numpy()), jnp.array(self.B.data.numpy())
