@@ -7,6 +7,7 @@ import time
 import matplotlib.pyplot as plt
 import dill
 from dill.source import getsource
+import traceback
 
 # for multiprocessing
 import os
@@ -154,7 +155,7 @@ class Experiment:
                 if append_list is None: 
                     postfix = {}
                     if state is not None and state.shape == (1,): postfix['state'] = state.item()
-                    if control.shape == (1,): postfix['control'] = control.item()
+                    postfix['control'] = control.item() if control.shape == (1,) else control
                     postfix['cost'] = cost
                     pbar.set_postfix(postfix)
                 
@@ -175,6 +176,7 @@ class Experiment:
                     counter.value += 1
         except Exception as e:
             logging.error('(EXPERIMENT): {}'.format(e))
+            traceback.print_exc()
             if append_list is not None: 
                 with counter.get_lock():
                         counter.value += 1

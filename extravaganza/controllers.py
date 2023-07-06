@@ -179,7 +179,7 @@ class LiftedBPC(Controller):
         
         # 2. explore for sysid, and then maybe get stabilizing controller
         if self.t < self.T0:
-            control = self.sysid.perturb_control(state)  # TODO should rescaling be applied to this?
+            control = self.rescale_u(self.sysid.perturb_control(state))  # TODO should rescaling be applied to this?
             if self.bounds is not None: control = control.clip(*self.bounds)
             self.prev_state = state
             self.prev_control = control
@@ -210,13 +210,13 @@ class LiftedBPC(Controller):
             self.M0 -= self.M0_update_rescaler.step(sum([g[1] for g in grads]), iterate=self.M0)
             self.K -= self.K_update_rescaler.step(sum([g[2] for g in grads]), iterate=self.K)
             
-        # # ensure norms are good
-        # norm = jnp.linalg.norm(self.M)  
-        # if norm > 1:
-        #    self.M /= norm
-        # norm = jnp.linalg.norm(self.K)  
-        # if norm > 1:
-        #     self.K /= norm
+        # ensure norms are good
+        norm = jnp.linalg.norm(self.M)  
+        if norm > 1:
+           self.M /= norm
+        norm = jnp.linalg.norm(self.K)  
+        if norm > 1:
+            self.K /= norm
         
         # 5. compute newest perturbed control
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
@@ -244,8 +244,8 @@ class LiftedBPC(Controller):
 #         control = self.sysid.perturb_control(state, control=control)  # perturb for sysid purposes later than T0?
 
         # cache it
-        # self.prev_cost = cost
-        self.prev_cost = jnp.mean(self.cost_history).item()
+        self.prev_cost = cost
+        # self.prev_cost = jnp.mean(self.cost_history).item()
         self.prev_state = state
         self.prev_control = control 
         self.cost_accum += cost
@@ -264,7 +264,7 @@ class LiftedBPC(Controller):
             self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))).item(), t=self.t)
             self.stats.update('M0', self.M0.item(), t=self.t)
             
-        return control
+        return jnp.clip(control, -1e8, 1e8)
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         return self(cost)
@@ -472,7 +472,6 @@ class PID(Controller):
         obs_dim = int(sum(obs_mask))
         if isinstance(setpoint, float): setpoint = jnp.array([setpoint])
         assert setpoint.shape == (obs_dim,)
-        
         self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, obs_dim) if t is not None else jnp.zeros((control_dim, obs_dim)), 
                                         [Kp, Ki, Kd])
         self.obs_dim = obs_dim
@@ -526,7 +525,8 @@ class PID(Controller):
             self.stats.update('P', p.item(), t=self.t)
             self.stats.update('I', i.item(), t=self.t)
             self.stats.update('D', d.item(), t=self.t)
-        return control
+            
+        return control.reshape(self.control_dim)
 
 """
 Regular clipped PPO implementation, with no target networks, no delayed updates, and no experience replay.
@@ -570,6 +570,7 @@ class PPO(Controller):
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
         
         # things to keep track of
+        self.exp_counter = 0  # for a random exploration phase
         self.prob_act = None
         self.state = None
         self.cost = None
@@ -587,18 +588,19 @@ class PPO(Controller):
     
     def reset(self, seed: int = None):
         set_seed(seed)  # for reproducibility
+        self.exp_counter = 0  # for a random exploration phase
         self.prob_act = None
         self.state = None
         self.cost = None
 
-        # reset models
-        for model in [self.actor, self.critic]:
-            for layer in model.modules():
-                if hasattr(layer, 'reset_parameters'):
-                    layer.reset_parameters()
-            model.train()
-        for opt in [self.actor_opt, self.critic_opt]:
-            opt.__setstate__({'state': defaultdict(dict)}) 
+        # # reset models
+        # for model in [self.actor, self.critic]:
+        #     for layer in model.modules():
+        #         if hasattr(layer, 'reset_parameters'):
+        #             layer.reset_parameters()
+        #     model.train()
+        # for opt in [self.actor_opt, self.critic_opt]:
+        #     opt.__setstate__({'state': defaultdict(dict)}) 
         return self
     
     def policy_loss(self, old_log_prob, log_prob, advantage, eps):
@@ -622,9 +624,9 @@ class PPO(Controller):
         prob_act = dist.log_prob(action)
         
         # update
-        if self.prob_act is not None:
+        if self.exp_counter > 1:
             reward = self.cost - cost  # because `cost = -\sum_i reward_i`
-            advantage = reward + (1 - done) * self.gamma * self.critic(state) - self.critic(torch.from_numpy(self.state))
+            advantage = reward + (1 - done) * self.gamma * self.critic(state) - self.critic(self.state)
             
             actor_loss = self.policy_loss(self.prob_act.detach(), prob_act, advantage.detach(), self.eps_clip)
             self.actor_opt.zero_grad()
@@ -639,12 +641,13 @@ class PPO(Controller):
         self.state = state
         self.prob_act = prob_act
         self.cost = cost
+        self.exp_counter += 1
         
         self.t += 1
-        self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
-        self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
-        self.stats.update('gamma', self.ppo.gamma, t=self.t)
-        self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
+        self.stats.update('lr_actor', self.actor_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('lr_critic', self.critic_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('gamma', self.gamma, t=self.t)
+        self.stats.update('eps_clip', self.eps_clip, t=self.t)
         
         return jnp.array(action.detach().data.numpy())
     

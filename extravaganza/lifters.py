@@ -162,8 +162,9 @@ class LearnedLift(Lifter, SysID):
     
         # to estimate linear dynamics of lifted states
         self.A = torch.nn.Parameter(0.99 * torch.eye(self.state_dim, dtype=torch.float32))  # for stability purposes :)
-        self.B = torch.nn.Parameter(torch.zeros((self.state_dim, self.control_dim), dtype=torch.float32))
-        self.sysid_opt = torch.optim.Adam([self.A, self.B], lr=sysid_lr)
+        self.B = torch.nn.Parameter(torch.from_numpy(np.array(sample(jkey(), shape=(self.state_dim, self.control_dim), sampling_method='sphere'))))
+        self.sysid_opt = torch.optim.Adam([self.A,], lr=sysid_lr)
+        logging.warn('(LIFTER): note that right now we are NOT LEARNING B!!')
         
         # to learn "inverse" of lifing function
         self.cost_model = MLP(layer_dims=exponential_linspace_int(self.state_dim + self.control_dim, 1, depth),
@@ -240,9 +241,9 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-6, 0, 1e-5
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-6, 0, 0
                 norm = torch.norm(state)
-                state_norm = (1 / (norm + 1e-8)) + norm if LAMBDA_STATE_NORM > 0 else 0.
+                state_norm = (1 / (norm + 1e-8)) + 1e-2 * norm if LAMBDA_STATE_NORM > 0 else 0.
                 stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) / opnorm(self.A) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
                 loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm

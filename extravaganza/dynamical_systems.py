@@ -19,8 +19,7 @@ import gymnasium as gym
 from extravaganza.controllers import PID, PPO
 from extravaganza.models import MLP, CNN
 from extravaganza.stats import Stats
-from extravaganza.utils import device, set_seed, jkey, sample, get_classname, ContinuousCartPoleEnv, PPO
-        
+from extravaganza.utils import device, set_seed, jkey, sample, get_classname, ContinuousCartPoleEnv
                 
 class DynamicalSystem:
     
@@ -408,7 +407,10 @@ class COCO(LDS):
             cost = self.problem(full_x.at[idxs].set(v))
             sq_dist = ((x - v) ** 2).sum()  # how far past `[-5, 5]^dim` we are
             return cost + lambda_dist * sq_dist
-        self.cost_fn = lambda x, u: cost_fn(x) + u.T @ self.R @ u
+        if predict_differences:
+            self.cost_fn = lambda x, u: cost_fn(x) + u.T @ self.R @ u
+        else:
+            self.cost_fn = lambda x, u: cost_fn(x)
         
         # find optimal control
         n = 5000
@@ -448,15 +450,16 @@ class Gym(DynamicalSystem):
         self.reset_seed = seed
         
         # env
+        self.continuous_action_space = 'continuous' in env_name.lower()
         if env_name == 'CartPoleContinuous-v1':
             self.env = ContinuousCartPoleEnv()
             if render: logging.warning('({}) i havent yet set up rendering for continuous cartpole :)'.format(get_classname(self)))
         else: self.env = gym.make(env_name, render_mode='human' if render else None)
         self.state_dim = self.env.observation_space.shape[0]
-        self.control_dim = self.env.action_space.shape[0]
+        self.control_dim = self.env.action_space.shape[0] if self.continuous_action_space else 1
         
         if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda obs: abs(0.45 - obs.item())  # L1 distance from flag
-        elif env_name == 'CartPoleContinuous-v1': self.cost_fn = lambda obs: obs.item() ** 2  # MSE of pole angle
+        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: self.cost_fn = lambda obs: obs.item() ** 2  # MSE of pole angle
         else: raise NotImplementedError(env_name)
         self.initial_state, _ = self.env.reset()
         self.reset(self.reset_seed)
@@ -468,7 +471,7 @@ class Gym(DynamicalSystem):
             stats = Stats()
         self.stats = stats
         if self.state_dim == 1: self.stats.register('xs', float, plottable=True)
-        if self.control_dim == 1: self.stats.register('us', float, plottable=True)
+        if self.control_dim == 1 or not self.continuous_action_space: self.stats.register('us', float, plottable=True)
         self.stats.register('fs', float, plottable=True)
         self.stats.register('avg fs', float, plottable=True)
         self.stats.register('rewards', float, plottable=True)
@@ -491,27 +494,27 @@ class Gym(DynamicalSystem):
         """
         given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
         """
-        assert control.shape == (self.control_dim,)
+        if self.continuous_action_space: assert control.shape == (self.control_dim,), control.shape
         if self.done: self.reset(self.reset_seed)
-        
-        c = np.array(control)
+
+        control = np.array(control)
         for _ in range(self.repeat):
             if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
             if self.done: break
-            self.state, r, self.done, _, _ = self.env.step(c)
+            self.state, r, self.done, _, _ = self.env.step(control if self.continuous_action_space else control.item())
             self.episode_reward += r
             self.episode_t += 1
         cost = -self.episode_reward if self.use_reward_costs else self.cost_fn(self.state)
 
         # update
         if self.state_dim == 1: self.stats.update('xs', self.state.item(), t=self.t)
-        if self.control_dim == 1: self.stats.update('us', control.item(), t=self.t)
+        if self.control_dim == 1 or not self.continuous_action_space: self.stats.update('us', float(control.item()), t=self.t)
         self.stats.update('fs', cost, t=self.t)
         self.stats.update('rewards', self.episode_reward, t=self.t)
         self.t += 1
         
         return cost, jnp.array(self.state) if not self.done else 'done'
-        
+
 
 class PIDGym(DynamicalSystem):
     def __init__(self, 
@@ -547,14 +550,14 @@ class PIDGym(DynamicalSystem):
         if env_name == 'MountainCarContinuous-v0': 
             setpoint = 0.45
             obs_mask = [1, 0]  # gets x position
-        elif env_name == 'CartPoleContinuous-v1': 
+        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: 
             setpoint = 0.
             obs_mask = [0, 0, 1, 0]  # gets pole angle
         else: raise NotImplementedError(env_name)
         
         # alg 
         pid_args = {
-            'control_dim': self.control_dim,
+            'control_dim': self.gym.control_dim,
             'setpoint': setpoint,
             'obs_mask': obs_mask,
             'Kp': Kp, 'Ki': Ki, 'Kd': Kd,
@@ -586,14 +589,18 @@ class PIDGym(DynamicalSystem):
         """
         given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
         """
-        assert control.shape == (self.control_dim,)
+        assert control.shape == (self.control_dim,), control.shape
             
         # apply control
         self.apply_control(control, self)
         for _ in range(self.repeat):
             action = self.pid.get_control(None, self.state) if self.state is not None else self.gym.env.action_space.sample()
-            action = jnp.clip(action, self.gym.env.action_space.low, self.gym.env.action_space.high)
             
+            if self.gym.continuous_action_space:
+                action = jnp.clip(action, self.gym.env.action_space.low, self.gym.env.action_space.high) 
+            else:   # if discrete cartpole
+                action = 1 if action > 0 else 0
+
             cost, state = self.gym.interact(action)
             if state == 'done':
                 self.state = None
@@ -647,8 +654,8 @@ class PPOGym(DynamicalSystem):
         
         # alg
         ppo_args = {
-            'state_dim': self.env.observation_space.shape[0],
-            'action_dim': self.gym.control_dim,
+            'state_dim': self.gym.env.observation_space.shape[0],
+            'control_dim': self.gym.control_dim,
             'lr_actor': lr_actor,
             'lr_critic': lr_critic,
             'gamma': gamma,
@@ -657,6 +664,7 @@ class PPOGym(DynamicalSystem):
         }
         self.ppo = PPO(**ppo_args)
         self.reset(self.seed)
+        assert not self.ppo.continuous_action_space, 'i havent yet coded continuous PPO'
         
         # stats to keep track of
         self.t = 0
@@ -665,15 +673,7 @@ class PPOGym(DynamicalSystem):
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        if self.env.observation_space.shape[0] == 1: self.stats.register('xs', float, plottable=True)
-        if self.control_dim == 1: self.stats.register('us', float, plottable=True)
-        self.stats.register('rewards', float, plottable=True)
-        self.stats.register('avg rewards', float, plottable=True)
-        self.stats.register('avg costs since reset', float, plottable=True, use_special_prefixes=False)
-        self.stats.register('lr_actor', float, plottable=True)
-        self.stats.register('lr_critic', float, plottable=True)
-        self.stats.register('gamma', float, plottable=True)
-        self.stats.register('eps_clip', float, plottable=True)
+        self.stats.register('avg rewards since reset', float, plottable=True, use_special_prefixes=False)
         pass
     
     def reset(self, seed: int = None):
@@ -683,8 +683,10 @@ class PPOGym(DynamicalSystem):
         # for reproducibility
         self.gym.reset(seed)
         self.episode_rewards = []
+        self.state = None
+        self.cost = None
 
-        # reset controller history
+        # reset controller
         self.ppo.reset(seed)
         return self
     
@@ -697,59 +699,18 @@ class PPOGym(DynamicalSystem):
         # apply control
         self.apply_control(control, self)
         for _ in range(self.repeat):
-            action = self.ppo.get_control(cost, self.state) if self.state is not None else self.gym.env.action_space.sample()
-            action = jnp.clip(action, self.gym.env.action_space.low, self.gym.env.action_space.high)
-            
-            cost, state = self.gym.interact(action)
-            if state == 'done':
+            action = self.ppo.get_control(self.cost, self.state) if self.state is not None else self.gym.env.action_space.sample()
+            action = jnp.array(action).reshape(self.control_dim)
+            if self.state == 'done':
                 self.state = None
                 self.ppo.reset(self.seed)
                 break
-            else:
-                self.state = state
+            self.cost, self.state = self.gym.interact(action)
         
         # update stats
         self.stats.update('avg rewards since reset', np.mean(self.episode_rewards) if len(self.episode_rewards) > 0 else 0., t=self.t)
-        self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
-        self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
-        self.stats.update('gamma', self.ppo.gamma, t=self.t)
-        self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
-        self.episode_rewards.append(-cost)
+        self.episode_rewards.append(-self.cost)
         self.t += 1
         
-        return cost, None
-    
-
-    # def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
-    #     """
-    #     given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
-    #     """
-    #     assert control.shape == (self.control_dim,)
-
-    #     if self.done: self.reset_env(self.reset_seed)
-            
-    #     # apply control
-    #     self.apply_control(control, self)
-    #     for _ in range(self.repeat):
-    #         if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
-    #         if self.done: break
-    #         self.state, self.prob_act, self.done, reward, action = self.ppo.update_step(self.env, self.state, self.prob_act)
-    #         self.episode_reward += reward
-    #         self.episode_t += 1
-    
-    #     cost = -self.episode_reward
+        return self.cost, None
         
-    #     # update stats
-    #     if self.env.observation_space.shape[0] == 1: self.stats.update('xs', float(self.state[0]), t=self.t)
-    #     if self.control_dim == 1: self.stats.update('us', float(action[0] if self.continuous_action_space else action), t=self.t)
-    #     self.stats.update('rewards', self.episode_reward, t=self.t)
-    #     self.stats.update('lr_actor', self.ppo.actor_opt.param_groups[0]['lr'], t=self.t)
-    #     self.stats.update('lr_critic', self.ppo.critic_opt.param_groups[0]['lr'], t=self.t)
-    #     self.stats.update('gamma', self.ppo.gamma, t=self.t)
-    #     self.stats.update('eps_clip', self.ppo.eps_clip, t=self.t)
-    #     self.stats.update('avg costs since reset', -np.mean(self.episode_costs) if len(self.episode_costs) > 0 else 0., t=self.t)
-    #     self.episode_costs.append(cost)
-    #     self.t += 1
-        
-    #     return cost, jnp.array(self.state)
-    
