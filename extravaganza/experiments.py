@@ -154,12 +154,12 @@ class Experiment:
                 
                 if append_list is None: 
                     postfix = {}
-                    if state is not None and state.shape == (1,): postfix['state'] = state.item()
+                    if isinstance(state, jnp.ndarray) and state.shape == (1,): postfix['state'] = state.item()
                     postfix['control'] = control.item() if control.shape == (1,) else control
                     postfix['cost'] = cost
                     pbar.set_postfix(postfix)
                 
-                if (state is not None and jnp.any(jnp.isnan(state))) or (cost > 1e20):
+                if (isinstance(state, jnp.ndarray) and jnp.any(jnp.isnan(state))) or (cost > 1e20):
                     logging.error('(EXPERIMENT): state {} or cost {} diverged'.format(state, cost))
                     if append_list is not None: 
                         with counter.get_lock():

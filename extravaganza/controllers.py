@@ -179,7 +179,7 @@ class LiftedBPC(Controller):
         
         # 2. explore for sysid, and then maybe get stabilizing controller
         if self.t < self.T0:
-            control = self.rescale_u(self.sysid.perturb_control(state))  # TODO should rescaling be applied to this?
+            control = self.rescale_u(self.M0 + self.sysid.perturb_control(state))  # TODO should rescaling be applied to this?
             if self.bounds is not None: control = control.clip(*self.bounds)
             self.prev_state = state
             self.prev_control = control
@@ -202,7 +202,7 @@ class LiftedBPC(Controller):
         d = self.d_rescale_u(self.prev_control)
         grad_M = self.grad_M(cost_diff) * d.reshape(1, -1, 1)
         grad_M0 = self.grad_M0(cost_diff) * d.reshape(-1)
-        grad_K = self.grad_K(cost_diff)
+        grad_K = self.grad_K(cost_diff) * d.reshape(-1, 1)
         self.grads.append((grad_M, grad_M0, grad_K))
         if len(self.grads) == self.grads.maxlen and self.t % self.step_every == 0:
             grads = list(self.grads)[:self.step_every]  # use updates starting from h steps ago
@@ -238,10 +238,10 @@ class LiftedBPC(Controller):
             if M0_scale > 0: self.eps = append(self.eps, eps)
             
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
-        control = self.inv_rescale_u(-K_tilde @ state) + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
+        control = -K_tilde @ state + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
         control = self.rescale_u(control)
         if self.bounds is not None: control = jnp.clip(control, *self.bounds)
-#         control = self.sysid.perturb_control(state, control=control)  # perturb for sysid purposes later than T0?
+#         control = self.sysid.perturb_control(state, control=control)  # TODO perturb for sysid purposes later than T0?
 
         # cache it
         self.prev_cost = cost

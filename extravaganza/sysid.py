@@ -36,7 +36,7 @@ class SysID:
                         state: jnp.ndarray,
                         control: jnp.ndarray=None):
         """
-        if `control` is not None, we perturb around this control only when 'HAZAN' mode. otherwise, we don't perturb
+        if `control` is not None, we perturb around this control only when 'moments' mode. otherwise, we don't perturb
         """
         assert state.shape == (self.state_dim,)
         

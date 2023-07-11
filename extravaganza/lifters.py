@@ -153,7 +153,7 @@ class LearnedLift(Lifter, SysID):
         self.batch_size = batch_size
         
         # to compute lifted states which hopefully respond linearly to the controls
-        flat_dim = hh + control_dim * hh  # TODO could add control history as an input as well!
+        flat_dim = hh + control_dim * hh
         self.lift_model = MLP(layer_dims=exponential_linspace_int(flat_dim, self.state_dim, depth), 
                               normalization = lambda dim: torch.nn.LayerNorm(dim),
                               use_bias=False, 
@@ -201,7 +201,7 @@ class LearnedLift(Lifter, SysID):
     def perturb_control(self,
                         state: jnp.ndarray,
                         control: jnp.ndarray = None):
-        assert state.shape == (self.state_dim,)
+        # assert state.shape == (self.state_dim,)
         eps = sample(jkey(), (self.control_dim,))  # random direction
         control = self.scale * eps
         self.t += 1
@@ -225,6 +225,7 @@ class LearnedLift(Lifter, SysID):
                                      [prev_cost_history, prev_control_history, cost_history, control_history, controls]))
         dl = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
         
+        # learn lifter
         losses = []
         for t in range(self.num_epochs):
             for prev_cost_history, prev_control_history, cost_history, control_history, controls in dl:
@@ -251,18 +252,47 @@ class LearnedLift(Lifter, SysID):
                 self.lift_opt.step()
                 self.sysid_opt.step()
                 
-                # self.cost_opt.zero_grad()
-                # fhat = self.cost_model(torch.cat((prev_state.detach(), control), dim=-1).reshape(-1, self.state_dim + self.control_dim))  # predict cost from state and control we played from that state
-                # f = histories[0][-1]
-                # loss = torch.nn.functional.mse_loss(fhat.squeeze(), torch.from_numpy(np.array(f)).squeeze())
-                # loss.backward()
-                # self.cost_opt.step()
-                
                 losses.append(loss.item())
                 
             print_every = 25
             if t % print_every == 0 or t == self.num_epochs - 1: 
                 logging.info('({}) \tmean loss for past {} epochs was {}'.format(get_classname(self), print_every, np.mean(losses[-print_every:])))
+        
+        # sysid
+        states = []
+        controls = []
+        for prev_histories, histories in self.buffer:
+            states.append(self.map(*prev_histories))
+            controls.append(histories[1][-1])
+        states, controls = np.array(states), np.array(controls)
+        from extravaganza.utils import least_squares, opnorm
+        A, B = least_squares(states, controls)
+        A, B = torch.from_numpy(np.array(A)), torch.from_numpy(np.array(B))
+        
+        def calc_loss(A, B):
+            with torch.no_grad():
+                l = 0.
+                for prev_cost_history, prev_control_history, cost_history, control_history, controls in dl:
+                    # compute disturbance
+                    prev_state = self.forward(prev_cost_history, prev_control_history)
+                    state = self.forward(cost_history, control_history)
+                    pred = A.expand(self.batch_size, self.state_dim, self.state_dim) @ prev_state.unsqueeze(-1) + \
+                        B.expand(self.batch_size, self.state_dim, self.control_dim) @ controls.unsqueeze(-1)
+                    diff = state - pred.squeeze(-1)
+                    
+                    # compute loss
+                    loss = torch.mean(torch.abs(diff))
+                    l += loss.item()
+                l /= len(dl)
+                return l
+        
+        print('|A|', opnorm(self.A), 
+              opnorm(A))
+        print('|A-BK|', opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))), 
+              opnorm(A - B @ dare_gain(A, B, torch.eye(self.state_dim), torch.eye(self.control_dim))))
+        print('|B|', torch.norm(self.B), torch.norm(B))
+        print('old', calc_loss(self.A, self.B), 'new', calc_loss(A, B))
+        self.A, self.B = A, B
             
         self.trained = True
         return losses

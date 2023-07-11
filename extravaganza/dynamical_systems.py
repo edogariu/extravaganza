@@ -6,6 +6,7 @@ from collections import defaultdict
 from sklearn.datasets import fetch_california_housing, load_diabetes, make_regression
 from sklearn.model_selection import train_test_split
 import cocoex
+from pykoopman.common import drss
 
 import numpy as np
 import torch
@@ -296,14 +297,8 @@ class LDS(DynamicalSystem):
         # figure out dynamics
         self.state_dim = state_dim
         self.control_dim = control_dim
-        if A is None:
-            done = False
-            while not done:
-                A = jax.random.normal(jkey(), (state_dim, state_dim))
-                done = jnp.max(jnp.abs(jnp.linalg.eigvals(A))) < 1
-        if B is None:
-            B = sample(jkey(), (state_dim, control_dim), 'sphere')
-        self.A, self.B = A, B
+        A, B, _ = drss(n=self.state_dim, p=self.control_dim, m=0)  # random discrete, stable system
+        self.A, self.B = jnp.array(A).reshape(state_dim, state_dim), jnp.array(B).reshape(state_dim, control_dim)
         assert self.A.shape == (state_dim, state_dim) and self.B.shape == (state_dim, control_dim)
         
         # figure out disturbances
@@ -336,7 +331,7 @@ class LDS(DynamicalSystem):
         self.stats = stats
         self.stats.register('xs', jnp.ndarray, plottable=True)
         self.stats.register('us', jnp.ndarray, plottable=True)
-        # self.stats.register('ws', float, plottable=True)
+        self.stats.register('ws', float, plottable=True)
         self.stats.register('fs', float, plottable=True)
         self.stats.register('avg fs', float, plottable=True)
         self.stats.register('avg fs since last reset', float, plottable=True, use_special_prefixes=False)
@@ -369,7 +364,7 @@ class LDS(DynamicalSystem):
         self.episode_fs.append(cost)
         self.stats.update('xs', self.state, t=self.t)
         self.stats.update('us', control, t=self.t)
-        # self.stats.update('ws', disturbance, t=self.t)
+        self.stats.update('ws', disturbance, t=self.t)
         self.stats.update('fs', cost, t=self.t)
         self.stats.update('avg fs since last reset', np.mean(self.episode_fs), t=self.t)
         self.state = state
@@ -458,8 +453,10 @@ class Gym(DynamicalSystem):
         self.state_dim = self.env.observation_space.shape[0]
         self.control_dim = self.env.action_space.shape[0] if self.continuous_action_space else 1
         
-        if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda obs: abs(0.45 - obs.item())  # L1 distance from flag
-        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: self.cost_fn = lambda obs: obs.item() ** 2  # MSE of pole angle
+        if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda state: abs(0.45 - state[0])  # L1 distance from flag
+        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: 
+            self.cost_fn = lambda state: abs(state[2]) if state[2] > 0 else (state[2] ** 2)  # MSE of pole angle
+            logging.warn('!!!!!!WARNING!!!!!!! using asymmetric cost fn for cartpole because I was testing that one thing')
         else: raise NotImplementedError(env_name)
         self.initial_state, _ = self.env.reset()
         self.reset(self.reset_seed)
@@ -495,7 +492,8 @@ class Gym(DynamicalSystem):
         given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
         """
         if self.continuous_action_space: assert control.shape == (self.control_dim,), control.shape
-        if self.done: self.reset(self.reset_seed)
+        if self.done: 
+            self.reset(self.reset_seed)
 
         control = np.array(control)
         for _ in range(self.repeat):
