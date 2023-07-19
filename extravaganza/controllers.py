@@ -367,6 +367,7 @@ class GPC(_GPC):
             self.stats.update('K @ state', (-self.K @ self.state).item(), t=self.t)
             self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.last_h_noises(), axes=([0, 2], [0, 1]))).item(), t=self.t)
             self.stats.update('M0', 0., t=self.t)
+        assert state.ndim == 1, state.shape
             
         return self(state)
     
@@ -650,4 +651,20 @@ class PPO(Controller):
         self.stats.update('eps_clip', self.eps_clip, t=self.t)
         
         return jnp.array(action.detach().data.numpy())
+    
+class LambdaController(Controller):
+    def __init__(self, controller: Controller, init_fn, get_control):
+        super().__init__()
+        self._controller = controller
+        self.control_dim = self._controller.control_dim
+        self._init_fn = init_fn
+        self._get_control = get_control
+        self._init_fn(self)
+        self.stats = self._controller.stats
+        self.stats.register('state_norm', float, plottable=True)
+        pass
+    
+    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+        control = self._get_control(self, cost, state)
+        return control
     

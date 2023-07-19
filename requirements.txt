@@ -12,6 +12,8 @@ pathos
 gymnasium[classic-control]
 deluca
 dill
+pytorch-metric-learning
+seaborn
 
 # things for pykoopman
 optht
@@ -26,3 +28,4 @@ git+https://github.com/gbaydin/hypergradient-descent.git
 # for notebooks
 ipykernel
 jupyter
+nbconvert[webpdf]

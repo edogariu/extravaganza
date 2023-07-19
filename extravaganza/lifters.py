@@ -3,13 +3,14 @@ from abc import abstractmethod
 import inspect
 from typing import Tuple
 from collections import deque
+import tqdm
 
 import numpy as np
 import jax.numpy as jnp
 
 from extravaganza.models import MLP
 from extravaganza.sysid import SysID
-from extravaganza.utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain, get_classname
+from extravaganza.utils import exponential_linspace_int, sample, set_seed, jkey, opnorm, dare_gain, get_classname, least_squares
 
 class Lifter:
     """
@@ -134,7 +135,6 @@ class LearnedLift(Lifter, SysID):
                  scale: float = 0.1,
                  lift_lr: float = 0.001,
                  sysid_lr: float = 0.001,
-                 cost_lr: float = 0.001,
                  buffer_maxlen: int = int(1e9),
                  batch_size: int = 64,
                  num_epochs: int = 20,  # number of epochs over the buffer to use when querying `sysid()` or `dynamics()` for first time
@@ -163,13 +163,8 @@ class LearnedLift(Lifter, SysID):
         # to estimate linear dynamics of lifted states
         self.A = torch.nn.Parameter(0.99 * torch.eye(self.state_dim, dtype=torch.float32))  # for stability purposes :)
         self.B = torch.nn.Parameter(torch.from_numpy(np.array(sample(jkey(), shape=(self.state_dim, self.control_dim), sampling_method='sphere'))))
-        self.sysid_opt = torch.optim.Adam([self.A,], lr=sysid_lr)
-        logging.warn('(LIFTER): note that right now we are NOT LEARNING B!!')
-        
-        # to learn "inverse" of lifing function
-        self.cost_model = MLP(layer_dims=exponential_linspace_int(self.state_dim + self.control_dim, 1, depth),
-                              seed=seed).train().float()
-        self.cost_opt = torch.optim.Adam(self.cost_model.parameters(), lr=cost_lr)
+        self.sysid_opt = torch.optim.Adam([self.A, self.B], lr=sysid_lr)
+        # logging.warn('(LIFTER): note that right now we are NOT LEARNING B!!')
         
         self.t = 1
         self.trained = False
@@ -224,10 +219,10 @@ class LearnedLift(Lifter, SysID):
         dataset = TensorDataset(*map(lambda l: torch.stack(l, dim=0), 
                                      [prev_cost_history, prev_control_history, cost_history, control_history, controls]))
         dl = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
-        
+
         # learn lifter
         losses = []
-        for t in range(self.num_epochs):
+        for t in tqdm.trange(self.num_epochs):
             for prev_cost_history, prev_control_history, cost_history, control_history, controls in dl:
                 
                 # compute disturbance
@@ -242,10 +237,10 @@ class LearnedLift(Lifter, SysID):
                 self.sysid_opt.zero_grad()
                 
                 # compute loss
-                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-6, 0, 0
+                LAMBDA_STATE_NORM, LAMBDA_STABILITY, LAMBDA_B_NORM = 1e-5, 1e-5, 1e-5
                 norm = torch.norm(state)
                 state_norm = (1 / (norm + 1e-8)) + 1e-2 * norm if LAMBDA_STATE_NORM > 0 else 0.
-                stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) / opnorm(self.A) if LAMBDA_STABILITY > 0 else 0.
+                stability = opnorm(self.A - self.B @ dare_gain(self.A, self.B, torch.eye(self.state_dim), torch.eye(self.control_dim))) if LAMBDA_STABILITY > 0 else 0.
                 B_norm = 1 / (torch.norm(self.B) + 1e-8) if LAMBDA_B_NORM > 0 else 0.
                 loss = torch.mean(torch.abs(diff)) + LAMBDA_STATE_NORM * state_norm + LAMBDA_STABILITY * stability + LAMBDA_B_NORM * B_norm
                 loss.backward()
@@ -265,7 +260,7 @@ class LearnedLift(Lifter, SysID):
             states.append(self.map(*prev_histories))
             controls.append(histories[1][-1])
         states, controls = np.array(states), np.array(controls)
-        from extravaganza.utils import least_squares, opnorm
+
         A, B = least_squares(states, controls)
         A, B = torch.from_numpy(np.array(A)), torch.from_numpy(np.array(B))
         
@@ -292,7 +287,7 @@ class LearnedLift(Lifter, SysID):
               opnorm(A - B @ dare_gain(A, B, torch.eye(self.state_dim), torch.eye(self.control_dim))))
         print('|B|', torch.norm(self.B), torch.norm(B))
         print('old', calc_loss(self.A, self.B), 'new', calc_loss(A, B))
-        self.A, self.B = A, B
+        # self.A, self.B = A, B
             
         self.trained = True
         return losses
