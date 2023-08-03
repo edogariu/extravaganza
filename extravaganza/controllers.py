@@ -1,83 +1,97 @@
 import logging
 from abc import abstractmethod
 from typing import Tuple
-from collections import deque, defaultdict
+from collections import deque
 
 import jax.numpy as jnp
 
-from extravaganza.lifters import Lifter
-from extravaganza.sysid import SysID
 from extravaganza.stats import Stats
-from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname
+from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname, dare_gain
+
+BETA = 1e1  # norm clipping for both the controller matrices and their grads
+
+def clip(x: jnp.ndarray, name: str = None, beta: float = BETA):
+    norm = jnp.linalg.norm(x)  
+    if norm > beta:
+        if name is not None: logging.info('(CONTROLLER): clipped {}!'.format(name))
+        x /= (norm / beta)
+    return x
+    
 
 class Controller:
     """
     abstract class for all controllers
     """
     control_dim: int = None
+    state_dim: int = None
+    stats: Stats = None
     
     @abstractmethod
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         """
-        gets the next control as a function of the cost and arrived-in state from playing the previous control
+        gets the next control as a function of the cost and arrived-in observation from playing the previous control (and possibly the disturbance given by the arrived-in observation)
+        """
+        pass
+                           
+    def update(self, 
+               state: jnp.ndarray, cost: float,   # state we were in 
+               control: jnp.ndarray,  # control we played
+               next_state: jnp.ndarray, next_cost: float,  # state we landed in
+               ):
+        """
+        Function to update the controller, by default a no-op
+        """
+        pass
+    
+    def system_reset_hook(self):
+        """
+        This is a function that gets called every time the dynamical system we are controlling gets episodically reset.
+        For convenience only, by default a no-op
         """
         pass
 
 
-class LiftedBPC(Controller):
+class EvanBPC(Controller):
     """
     Naturally expected to output on the scale of `(-1, 1)`.
     If `bounds` is not `None`, it will automatically clip (or apply `tanh`) and rescale to the given bounds.
     """
     def __init__(self,
+                 A: jnp.ndarray,
+                 B: jnp.ndarray,
                  h: int,
                  initial_u: jnp.ndarray,
                  rescalers,
                  initial_scales: Tuple[float, float, float],
-                 T0: int,
                  bounds = None,
                  method = 'REINFORCE',
-                 lifter: Lifter = None,
-                 sysid: SysID = None,
-                 K: jnp.ndarray = None,
-                 step_every: int = 1,
-                 use_tanh = True,
+                 use_tanh = False,
                  decay_scales = False,
-                 use_K_from_sysid: bool = False,
+                 use_stabilizing_K: bool = False,
                  seed: int = None,
                  stats: Stats = None):
 
         set_seed(seed)  # for reproducibility
         
         # check things make sense
-        if lifter is None and isinstance(sysid, Lifter): lifter = sysid
-        if sysid is None and isinstance(lifter, SysID): sysid = lifter
-        assert lifter.state_dim == sysid.state_dim
-        assert lifter.control_dim == sysid.control_dim and initial_u.shape[0] == lifter.control_dim
-        self.control_dim = lifter.control_dim
-        self.state_dim = lifter.state_dim
+        self.state_dim, self.control_dim = B.shape
+        
+        assert initial_u.shape[0] == self.control_dim
         assert method in ['FKM', 'REINFORCE']
         assert all(map(lambda i: i >= 0, initial_scales))
         if bounds is not None:
             bounds = jnp.array(bounds).reshape(2, -1)
             assert len(bounds[0]) == len(bounds[1]) and len(bounds[0]) == self.control_dim, 'improper bounds'
             assert all(map(lambda i: bounds[0, i] < bounds[1, i], range(self.control_dim))), 'improper bounds'
-        if K is not None:
-            assert K.shape == (self.control_dim, self.state_dim)
-        assert step_every < h, 'need to update at least every `h` steps'
+        
+        self.A, self.B = A, B
         
         # hyperparams
         self.h = h
-        self.hh = lifter.hh
-        self.lifter = lifter
-        self.sysid = sysid
-        self.T0 = T0
         self.method = method
         self.bounds = bounds
         self.decay_scales = decay_scales
-        self.use_K_from_sysid = use_K_from_sysid
         self.initial_control = initial_u
-        self.step_every = step_every
 
         # for rescaling controls
         self.rescale_u = lambda u: rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else u
@@ -87,18 +101,21 @@ class LiftedBPC(Controller):
         # controller params
         self.M = jnp.zeros((self.h, self.control_dim, self.state_dim))
         self.M0 = self.inv_rescale_u(initial_u)
-        self.K = K if K is not None else jnp.zeros((self.control_dim, self.state_dim)) # jax.random.normal(self.jkey(), shape=(self.control_dim, self.state_dim)) / (self.control_dim * self.state_dim)
+        self.K = jnp.zeros((self.control_dim, self.state_dim))
+        if use_stabilizing_K:  # initialize state feedback controller as LQR solution to stabilize system
+            K = dare_gain(self.A, self.B)
+            oppy = opnorm(self.A - self.B @ K)
+            if oppy < 1:
+                logging.info('(CONTROLLER): we WILL be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
+                self.K = K
+            else: logging.warning('(CONTROLLER): we will NOT be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
         self.M_scale, self.M0_scale, self.K_scale = initial_scales
         
         # histories are rightmost recent (increasing in time)
-        self.prev_cost = 0.
+        self.costs = deque(maxlen=2 * self.h)
         self.prev_control = jnp.zeros(self.control_dim)
-        self.prev_state = jnp.zeros(self.state_dim)
         self.disturbance_history = jnp.zeros((2 * self.h, self.state_dim))  # past 2h disturbances, for controller
         self.state_history = jnp.zeros((2 * self.h, self.state_dim))
-        self.cost_history = jnp.zeros(self.hh)  # for sysid/lifting
-        self.control_history = jnp.zeros((self.hh, self.control_dim))  # for sysid/lifting
-        self.cost_accum = 0.
         self.t = 1
 
         # grad estimation stuff -- NOTE maybe `self.eps` should be divided by its variance?
@@ -117,12 +134,12 @@ class LiftedBPC(Controller):
         elif self.method == 'REINFORCE':
             self.eps = jnp.zeros((self.h + 1, self.control_dim))  # noise history of u perturbations
             
-            def grad_M(diff):
+            def grad_M(diff) -> jnp.ndarray:
                 val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.disturbance_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)])
                 return diff * val #* self.control_dim * self.state_dim * self.h
-            def grad_M0(diff):
+            def grad_M0(diff) -> jnp.ndarray:
                 return diff * self.eps[-1] #* self.control_dim * self.state_dim * self.h
-            def grad_K(diff):
+            def grad_K(diff) -> jnp.ndarray:
                 # val = self.eps[-1].reshape(self.control_dim, 1) @ self.prev_state.reshape(1, self.state_dim)
                 val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.state_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)]).sum(axis=0)
                 return diff * val #* self.control_dim * self.state_dim * self.h
@@ -138,87 +155,22 @@ class LiftedBPC(Controller):
         
         # stats
         if stats is None:
-            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
+            logging.debug('({}): no `Stats` object provided, so we will use the sysid states.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('||A-BK||_op', float, plottable=True)
-        self.stats.register('||A||_op', float, plottable=True)
-        self.stats.register('||B||_F', float, plottable=True)
-        self.stats.register('disturbances', float, plottable=True)
-        self.stats.register('costs', float, plottable=True)
-        self.stats.register('cost diffs', float, plottable=True)
-        self.stats.register('avg costs', float, plottable=True)
-        self.stats.register('lifter losses', float, plottable=True)
-        if self.control_dim == 1:
-            self.stats.register('K @ state', float, plottable=True)
-            self.stats.register('M \cdot w', float, plottable=True)
-            self.stats.register('M0', float, plottable=True)
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
         pass
 
 # ------------------------------------------------------------------------------------------------------------
     
-    def __call__(self, cost: float) -> jnp.ndarray:
-        """
-        Returns the control based on current cost and internal parameters.
-        """
-        # cost = cost - self.cost_accum / self.t  # subtract running avg
+    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+        assert state.shape == (self.state_dim,)
         
-        # 1. observe next state and update histories
-        prev_histories = (self.cost_history, self.control_history)
-        self.cost_history = append(self.cost_history, cost)
-        self.control_history = append(self.control_history, self.prev_control)
-        self.t += 1
-        histories = (self.cost_history, self.control_history)
-        state = self.lifter.map(*histories)  # xhat_{t+1}
-        self.state_history = append(self.state_history, state)
-        if self.t < self.T0: 
-            lifter_loss = self.lifter.update(prev_histories, histories)  # update lifter, if needed
-        else:
-            if self.t == self.T0: logging.info('({}) Note that we are only updating lifter during sysid phase'.format(get_classname(self)))
-            lifter_loss = 0.
-        
-        # 2. explore for sysid, and then maybe get stabilizing controller
-        if self.t < self.T0:
-            control = self.rescale_u(self.M0 + self.sysid.perturb_control(state))  # TODO should rescaling be applied to this?
-            if self.bounds is not None: control = control.clip(*self.bounds)
-            self.prev_state = state
-            self.prev_control = control
-            return control
-        elif self.use_K_from_sysid and self.t == self.T0:  # get the K from sysid every so often
-            logging.info('({}) copying the K from {}'.format(get_classname(self), self.sysid))
-            self.K = self.sysid.get_lqr()
-            pass
-    
-        # 3. compute disturbance
-        pred_state = self.sysid.dynamics(self.prev_state, self.prev_control)  # A @ xhat_t + B @ u_t
-        disturbance = state - pred_state  # xhat_{t+1} - (A @ xhat_t + B @ u_t)
-        self.disturbance_history = append(self.disturbance_history, disturbance)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
-        
-        # compute change in cost, as well as the new scale
-        cost_diff = cost - self.prev_cost
-        M_scale, M0_scale, K_scale = map(lambda s: s / ((self.t - self.T0 + 1) ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
-
-        # 4. update controller
-        d = self.d_rescale_u(self.prev_control)
-        grad_M = self.grad_M(cost_diff) * d.reshape(1, -1, 1)
-        grad_M0 = self.grad_M0(cost_diff) * d.reshape(-1)
-        grad_K = self.grad_K(cost_diff) * d.reshape(-1, 1)
-        self.grads.append((grad_M, grad_M0, grad_K))
-        if len(self.grads) == self.grads.maxlen and self.t % self.step_every == 0:
-            grads = list(self.grads)[:self.step_every]  # use updates starting from h steps ago
-            self.M -= self.M_update_rescaler.step(sum([g[0] for g in grads]), iterate=self.M)
-            self.M0 -= self.M0_update_rescaler.step(sum([g[1] for g in grads]), iterate=self.M0)
-            self.K -= self.K_update_rescaler.step(sum([g[2] for g in grads]), iterate=self.K)
-            
-        # ensure norms are good
-        norm = jnp.linalg.norm(self.M)  
-        if norm > 1:
-           self.M /= norm
-        norm = jnp.linalg.norm(self.K)  
-        if norm > 1:
-            self.K /= norm
-        
-        # 5. compute newest perturbed control
+        M_scale, M0_scale, K_scale = map(lambda s: s / (self.t ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
 
         if self.method == 'FKM':  # perturb em all
@@ -240,38 +192,55 @@ class LiftedBPC(Controller):
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
         control = -K_tilde @ state + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
         control = self.rescale_u(control)
-        if self.bounds is not None: control = jnp.clip(control, *self.bounds)
-#         control = self.sysid.perturb_control(state, control=control)  # TODO perturb for sysid purposes later than T0?
-
-        # cache it
-        self.prev_cost = cost
-        # self.prev_cost = jnp.mean(self.cost_history).item()
-        self.prev_state = state
-        self.prev_control = control 
-        self.cost_accum += cost
+        if self.bounds is not None: 
+            for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *self.bounds[i]))
+            # control = jnp.clip(control, *self.bounds)
         
         # update stats
-        A, B = self.sysid.sysid()
-        self.stats.update('||A-BK||_op', opnorm(A - B @ self.K), t=self.t)
-        self.stats.update('||A||_op', opnorm(A), t=self.t)
-        self.stats.update('||B||_F', jnp.linalg.norm(B, 'fro').item(), t=self.t)
-        self.stats.update('disturbances', jnp.linalg.norm(disturbance).item(), t=self.t)
-        self.stats.update('costs', cost, t=self.t)
-        self.stats.update('cost diffs', cost_diff, t=self.t)
-        self.stats.update('lifter losses', lifter_loss, t=self.t)
-        if self.control_dim == 1:
-            self.stats.update('K @ state', (-self.K @ state).item(), t=self.t)
-            self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))).item(), t=self.t)
-            self.stats.update('M0', self.M0.item(), t=self.t)
-            
+        self.stats.update('states', state, t=self.t)
+        self.stats.update('-K @ state', (-self.K @ state).reshape(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', self.M0, t=self.t)
         return jnp.clip(control, -1e8, 1e8)
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
-        return self(cost)
     
+    def update(self, state: jnp.ndarray, cost: float, control: jnp.ndarray, next_state: jnp.ndarray, next_cost: float):
+        assert state.shape == next_state.shape and state.shape == (self.state_dim,)
+        assert control.shape == (self.control_dim,)
+                
+        self.t += 1
+        
+        # 1. observe state and disturbance
+        disturbance = next_state - (self.A @ state + self.B @ control)
+        self.state_history = append(self.state_history, next_state)
+        self.disturbance_history = append(self.disturbance_history, disturbance)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+        
+        # 2. compute change in cost for zero order optimization
+        cost_diff = next_cost - cost
 
+        # 3. update controller
+        d = self.d_rescale_u(control)
+        grad_M = self.grad_M(cost_diff) * d.reshape(1, -1, 1)
+        grad_M0 = self.grad_M0(cost_diff) * d.reshape(-1)
+        grad_K = self.grad_K(cost_diff) * d.reshape(-1, 1)
+        self.grads.append((grad_M, grad_M0, grad_K))
+        if len(self.grads) == self.grads.maxlen:
+            grad_M, grad_M0, grad_K = map(lambda arr: clip(arr), self.grads.popleft())  # use updates starting from h steps ago via popping left
+            self.M += self.M_update_rescaler.step(grad_M, iterate=self.M)
+            self.M0 -= self.M0_update_rescaler.step(grad_M0, iterate=self.M0)
+            self.K -= self.K_update_rescaler.step(grad_K, iterate=self.K)  # note that this is minus since  u = -K @ x + ...
+            
+        # 4. ensure norms are good
+        self.M = clip(self.M, 'M')
+        self.K = clip(self.K, 'K')
+        self.M0 = clip(self.M0, 'M0')
+            
+        self.stats.update('disturbances', disturbance, t=self.t)
+        pass
+        
+    
 # ---------------------------------------------------------------------------------------------------------------------
-#         VARIOUS BASELINES
+#         VARIOUS BASELINES AND OTHER CONTROLLERS
 # ---------------------------------------------------------------------------------------------------------------------
 
 from deluca.agents._lqr import LQR as _LQR
@@ -287,30 +256,47 @@ def get_seed(kwargs):
     return seed
     
 class ConstantController(Controller):
-    def __init__(self, value: float, control_dim: int, stats: Stats = None) -> None:
+    def __init__(self, value: jnp.ndarray, state_dim: int, stats: Stats = None) -> None:
         super().__init__()
-        self.value = float(value)
-        self.control_dim = control_dim
+        self.value = value
+        if not isinstance(self.value, jnp.ndarray):
+            self.value = jnp.array(self.value)
+        self.control_dim = value.shape[0]
+        self.state_dim = state_dim
+        
+        self.t = 0
         if stats is None:
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
-        return jnp.full(shape=(self.control_dim,), fill_value=self.value)
+        self.stats.update('states', state, t=self.t)
+        self.t += 1
+        return self.value
     
     
 class LQR(_LQR):
     def __init__(self, *args, **kwargs):
         set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
-        self.control_dim = self.K.shape[0]
+        self.control_dim, self.state_dim = self.K.shape
+
+        self.t = 0
         self.stats = Stats()
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
+        self.stats.update('states', state, t=self.t)
+        self.t += 1
         return self(state)
+    
+    def system_reset_hook(self): pass
+    def update(self, *args, **kwargs): pass
     
 class HINF(Controller):
     def __init__(self, 
@@ -338,13 +324,15 @@ class HINF(Controller):
         self.K = K
         self.t = 0
         self.stats = Stats()
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, 
                     cost: float, 
                     state: jnp.ndarray) -> jnp.ndarray:
-        assert state.shape == (self.state_dim,)
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         ret = self.K[min(self.t, len(self.K) - 1)] @ state
+        self.stats.update('states', state, t=self.t)
         self.t += 1
         return ret
     
@@ -352,64 +340,77 @@ class GPC(_GPC):
     def __init__(self, *args, **kwargs):
         set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
-        self.control_dim = self.K.shape[0]
+        self.control_dim, self.state_dim = self.K.shape
         self.stats = Stats()
-        self.stats.register('K @ state', float, plottable=True)
-        self.stats.register('M \cdot w', float, plottable=True)
-        self.stats.register('M0', float, plottable=True)
-        self.stats.register('disturbances', float, plottable=True)
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
-        if self.state.shape[0] == 1:
-            self.stats.update('disturbances', self.noise_history[-1].item(), t=self.t)
-        if self.action.shape[0] == 1:
-            self.stats.update('K @ state', (-self.K @ self.state).item(), t=self.t)
-            self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.last_h_noises(), axes=([0, 2], [0, 1]))).item(), t=self.t)
-            self.stats.update('M0', 0., t=self.t)
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
+        
+        self.stats.update('states', self.state.reshape(self.state_dim), t=self.t)
+        self.stats.update('-K @ state', (-self.K @ self.state).reshape(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.last_h_noises(), axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
+        self.stats.update('disturbances', self.noise_history[-1].reshape(self.state_dim), t=self.t)
         assert state.ndim == 1, state.shape
             
         return self(state)
     
+    def system_reset_hook(self): pass
+    def update(self, *args, **kwargs): pass
+
 class BPC(_BPC):
     def __init__(self, *args, **kwargs):
         set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
-        self.control_dim = self.K.shape[0]
+        self.control_dim, self.state_dim = self.K.shape
         self.stats = Stats()
-        self.stats.register('K @ state', float, plottable=True)
-        self.stats.register('M \cdot w', float, plottable=True)
-        self.stats.register('M0', float, plottable=True)
-        self.stats.register('disturbances', float, plottable=True)
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
-        if self.state.shape[0] == 1:
-            self.stats.update('disturbances', self.noise_history[-1].item(), t=self.t)
-        if self.action.shape[0] == 1:
-            self.stats.update('K @ state', (-self.K @ self.state).item(), t=self.t)
-            self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.noise_history, axes=([0, 2], [0, 1]))).item(), t=self.t)
-            self.stats.update('M0', 0., t=self.t)
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
+
+        self.stats.update('states', self.state.reshape(self.state_dim), t=self.t)
+        self.stats.update('-K @ state', (-self.K @ self.state).reshape(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.noise_history, axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
+        self.stats.update('disturbances', self.noise_history[-1].reshape(self.state_dim), t=self.t)
             
-        return self(state, cost)
+        return self(state.reshape(self.state_dim, 1), cost).reshape(self.control_dim)
     
+    def system_reset_hook(self): pass
+    def update(self, *args, **kwargs): pass
+ 
 class RBPC(Controller):  # from Udaya
-    def __init__(self, A, B, Q, R, M, H, lr, delta, noise_sd, seed: int = None):
+    def __init__(self, A, B, Q=None, R=None, M=5, H=5, lr=0.01, delta=0.001, noise_sd=0.05, seed: int = None):
         set_seed(seed)
         n, m = B.shape
+        if Q is None: Q = jnp.eye(n)
+        if R is None: R = jnp.eye(m)
         self.n, self.m = n, m
         self.lr, self.A, self.B, self.M, self.H, self.noise_sd = lr, A, B, M, H, noise_sd
         self.x, self.u, self.delta, self.t = jnp.zeros((n, 1)), jnp.zeros((m, 1)), delta, 0
         self.K, self.E, self.W = LQR(A, B, Q, R).K, jnp.zeros((M, n, m)), jnp.zeros((M + H -1, n))
         self.eps = sample(jkey(), (self.M, self.m), 'sphere')
         self.cost = 0.
-        self.control_dim = self.K.shape[0]
+        self.control_dim, self.state_dim = self.K.shape
         
         self.stats = Stats()
-        self.stats.register('K @ state', float, plottable=True)
-        self.stats.register('M \cdot w', float, plottable=True)
-        self.stats.register('M0', float, plottable=True)
-        self.stats.register('disturbances', float, plottable=True)
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
 
     def Egrad(self, cost):
@@ -419,17 +420,19 @@ class RBPC(Controller):  # from Udaya
         return gE * cost
 
     def act(self, x, cost):
+        x = x.reshape(self.n, 1)
+        
         # 1. Get gradient estimates
         delta_E = self.Egrad(cost - self.cost)
-        self.cost - cost
+        self.cost = cost
 
         # 2. Execute updates
         self.E -= self.lr * delta_E
 
-        # 3. Ensure norm is good
-        norm = jnp.linalg.norm(self.E)
-        if norm > 1:
-           self.E *= 1/ norm
+        # # 3. Ensure norm is good
+        # norm = jnp.linalg.norm(self.E)
+        # if norm > 1:
+        #    self.E *= 1/ norm
 
         # 4. Get new noise
         w = x - self.A @ self.x - self.B @ self.u
@@ -450,12 +453,14 @@ class RBPC(Controller):  # from Udaya
         return self.u.reshape(self.m)
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
-        if self.n == 1:
-            self.stats.update('disturbances', self.W[-1].item(), t=self.t)
-        if self.m == 1:
-            self.stats.update('K @ state', (-self.K @ self.x).item(), t=self.t)
-            self.stats.update('M \cdot w', (jnp.tensordot(self.E, self.W[-self.M:], axes=([0, 1], [0, 1]))).item(), t=self.t)
-            self.stats.update('M0', 0., t=self.t)
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
+        
+        self.stats.update('states', self.x.reshape(self.state_dim), t=self.t)
+        self.stats.update('-K @ state', (-self.K @ self.x).reshape(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', (jnp.tensordot(self.E, self.W[-self.M:], axes=([0, 1], [0, 1]))).reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
+        self.stats.update('disturbances', self.W[-1].reshape(self.state_dim), t=self.t)
+        
         return self.act(state, cost)
     
 # ----------------------------------------------------------------------------------------
@@ -470,45 +475,45 @@ class PID(Controller):
                  Kd: jnp.ndarray = None, 
                  stats: Stats = None):
         
-        obs_dim = int(sum(obs_mask))
+        state_dim = int(sum(obs_mask))
         if isinstance(setpoint, float): setpoint = jnp.array([setpoint])
-        assert setpoint.shape == (obs_dim,)
-        self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, obs_dim) if t is not None else jnp.zeros((control_dim, obs_dim)), 
+        assert setpoint.shape == (state_dim,)
+        self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, state_dim) if t is not None else jnp.zeros((control_dim, state_dim)), 
                                         [Kp, Ki, Kd])
-        self.obs_dim = obs_dim
+        self.state_dim = state_dim
         self.control_dim = control_dim
         self.setpoint = setpoint
         self.obs_idxs = jnp.where(jnp.array(obs_mask) == 1)[0]
         
-        self.p = jnp.zeros(self.obs_dim)  # keep track of current error
-        self.i = jnp.zeros(self.obs_dim)  # keep track of accumulated error
+        self.p = jnp.zeros(self.state_dim)  # keep track of current error
+        self.i = jnp.zeros(self.state_dim)  # keep track of accumulated error
 
         self.t = 0
         if stats is None:
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        if obs_dim == 1:
-            self.stats.register('Kp', float, plottable=True)
-            self.stats.register('Ki', float, plottable=True)
-            self.stats.register('Kd', float, plottable=True)
-            self.stats.register('P', float, plottable=True)
-            self.stats.register('I', float, plottable=True)
-            self.stats.register('D', float, plottable=True)
+        self.stats.register('states', obj_class=jnp.ndarray, shape=(state_dim,))
+        self.stats.register('Kp', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('Ki', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('Kd', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('P', obj_class=jnp.ndarray, shape=(state_dim,))
+        self.stats.register('I', obj_class=jnp.ndarray, shape=(state_dim,))
+        self.stats.register('D', obj_class=jnp.ndarray, shape=(state_dim,))
         pass
     
     def reset(self, seed: int = None):
         set_seed(seed)  # for reproducibility
 
-        self.p = jnp.zeros(self.obs_dim)
-        self.i = jnp.zeros(self.obs_dim)
+        self.p = jnp.zeros(self.state_dim)
+        self.i = jnp.zeros(self.state_dim)
         return self
     
     def get_control(self, 
                     cost: float, 
                     state: jnp.ndarray) -> jnp.ndarray:
         state = jnp.take(state, self.obs_idxs)
-        assert state.shape == (self.obs_dim,), state.shape
+        assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         
         error = state - self.setpoint
         
@@ -519,13 +524,13 @@ class PID(Controller):
         self.i += error
         self.t += 1
         
-        if self.obs_dim == 1:
-            self.stats.update('Kp', self.Kp.item(), t=self.t)
-            self.stats.update('Ki', self.Ki.item(), t=self.t)
-            self.stats.update('Kd', self.Kd.item(), t=self.t)
-            self.stats.update('P', p.item(), t=self.t)
-            self.stats.update('I', i.item(), t=self.t)
-            self.stats.update('D', d.item(), t=self.t)
+        self.stats.update('states', state, t=self.t)
+        self.stats.update('Kp', self.Kp.reshape(-1), t=self.t)
+        self.stats.update('Ki', self.Ki.reshape(-1), t=self.t)
+        self.stats.update('Kd', self.Kd.reshape(-1), t=self.t)
+        self.stats.update('P', p, t=self.t)
+        self.stats.update('I', i, t=self.t)
+        self.stats.update('D', d, t=self.t)
             
         return control.reshape(self.control_dim)
 
@@ -581,10 +586,10 @@ class PPO(Controller):
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('lr_actor', float, plottable=True)
-        self.stats.register('lr_critic', float, plottable=True)
-        self.stats.register('gamma', float, plottable=True)
-        self.stats.register('eps_clip', float, plottable=True)
+        self.stats.register('lr actor', obj_class=float, plottable=True)
+        self.stats.register('lr critic', obj_class=float, plottable=True)
+        self.stats.register('gamma', obj_class=float, plottable=True)
+        self.stats.register('eps clip', obj_class=float, plottable=True)
         pass
     
     def reset(self, seed: int = None):
@@ -610,7 +615,9 @@ class PPO(Controller):
         m = torch.min(ratio * advantage, clipped * advantage)
         return -m
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, obs: jnp.ndarray) -> jnp.ndarray:
+        assert obs.shape == (self.state_dim,), 'PPO requires full observation'
+        state = obs
         
         # compute next action
         if state != 'done':
@@ -645,10 +652,10 @@ class PPO(Controller):
         self.exp_counter += 1
         
         self.t += 1
-        self.stats.update('lr_actor', self.actor_opt.param_groups[0]['lr'], t=self.t)
-        self.stats.update('lr_critic', self.critic_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('lr actor', self.actor_opt.param_groups[0]['lr'], t=self.t)
+        self.stats.update('lr critic', self.critic_opt.param_groups[0]['lr'], t=self.t)
         self.stats.update('gamma', self.gamma, t=self.t)
-        self.stats.update('eps_clip', self.eps_clip, t=self.t)
+        self.stats.update('eps clip', self.eps_clip, t=self.t)
         
         return jnp.array(action.detach().data.numpy())
     
@@ -657,11 +664,9 @@ class LambdaController(Controller):
         super().__init__()
         self._controller = controller
         self.control_dim = self._controller.control_dim
-        self._init_fn = init_fn
         self._get_control = get_control
-        self._init_fn(self)
+        init_fn(self)
         self.stats = self._controller.stats
-        self.stats.register('state_norm', float, plottable=True)
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:

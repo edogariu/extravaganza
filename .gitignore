@@ -9,6 +9,8 @@ experiments/learning linear.ipynb
 experiments/.data
 fig.pdf
 *stuff*
+logs
+plots
 
 
 # Byte-compiled / optimized / DLL files

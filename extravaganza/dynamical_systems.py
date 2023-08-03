@@ -2,11 +2,11 @@ import logging
 from abc import abstractmethod
 from typing import Callable, Tuple, Union, Iterator
 from collections import defaultdict
+from dataclasses import dataclass
 
 from sklearn.datasets import fetch_california_housing, load_diabetes, make_regression
 from sklearn.model_selection import train_test_split
 import cocoex
-from pykoopman.common import drss
 
 import numpy as np
 import torch
@@ -18,9 +18,9 @@ import jax.numpy as jnp
 import gymnasium as gym
 
 from extravaganza.controllers import PID, PPO
-from extravaganza.models import MLP, CNN
+from extravaganza.models import TorchMLP, TorchCNN
 from extravaganza.stats import Stats
-from extravaganza.utils import device, set_seed, jkey, sample, get_classname, ContinuousCartPoleEnv
+from extravaganza.utils import device, set_seed, jkey, get_classname, ContinuousCartPoleEnv, random_lds
                 
 class DynamicalSystem:
     
@@ -47,32 +47,26 @@ class DynamicalSystem:
         """
         raise NotImplementedError()
     
-    
+@dataclass
 class NNTraining(DynamicalSystem):
     """
     neural network training is a dynamical system with learning rate and momentum as controls
     """
-    @abstractmethod
-    def __init__(self, seed: int = None, stats: Stats = None):
-        set_seed(seed)  # for reproducibility
+    # needs to set the following things
+    stats: Stats
+    model: torch.nn.Module   # this is basically the system state
+    opt: torch.optim.Optimizer
+    apply_control: Callable[[jnp.ndarray, DynamicalSystem], None]  # applies the control to the system (which might update the learning rate or momentum or something)
+    train_dl: DataLoader
+    val_dl: DataLoader
+    dl: Iterator
+    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
+    eval_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
+    eval_every: int = 1
+    repeat: int = 1
+    t: int = 0
+    episode_t: int = 1
         
-        # needs to set the following things
-        self.stats = stats
-        self.OBSERVABLE: bool = False
-        self.model: torch.nn.Module = None   # this is basically the state
-        self.opt: torch.optim.Optimizer = None
-        self.apply_control: Callable[[jnp.ndarray, DynamicalSystem],] = None  # applies the control to the system (which might update the learning rate or momentum or something)
-        self.train_dl: DataLoader = None
-        self.val_dl: DataLoader = None
-        self.dl: Iterator = None
-        self.loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
-        self.eval_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
-        self.eval_every: int = None
-        self.t: int = 0
-        
-        self.reset(seed)
-        raise NotImplementedError()
-    
     def reset(self, seed: int = None):
         """
         to reset an episode, which should send state back to init
@@ -81,29 +75,49 @@ class NNTraining(DynamicalSystem):
         for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
+                # try:
+                #     torch.nn.init.xavier_uniform_(layer.weight)
+                #     if hasattr(self.model, 'use_bias') and self.model.use_bias:
+                #         torch.nn.init.xavier_uniform_(layer.bias)
+                # except: pass
         self.model.train()  
         self.opt.__setstate__({'state': defaultdict(dict)})  
+        
+        if 'train losses' not in self.stats._stats: self.stats.register('train losses', obj_class=float)
+        if 'val losses' not in self.stats._stats: self.stats.register('val losses', obj_class=float)
+        if 'avg train losses since reset' not in self.stats._stats: self.stats.register('avg train losses since reset', obj_class=float)
+        if 'avg val losses since reset' not in self.stats._stats: self.stats.register('avg val losses since reset', obj_class=float)
+        if 'lrs' not in self.stats._stats: self.stats.register('lrs', obj_class=float)
+        if 'momenta' not in self.stats._stats: self.stats.register('momenta', obj_class=float)
+        self.episode_t = 1
+        self.episode_trainlosses = []
+        self.episode_vallosses = []
         return self
     
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
         # apply control
         self.apply_control(control, self)
         
-        # train step (observe costs)
-        try: 
-            x, y = next(self.dl)
-        except StopIteration: 
-            self.dl = iter(self.train_dl)
-            x, y = next(self.dl)
-        x = x.to(device); y = y.to(device)
-        self.opt.zero_grad()
-        train_loss = self.loss_fn(self.model(x), y)
-        train_loss.backward()
-        self.opt.step()
-        train_loss = train_loss.item()
+        tloss = 0.
+        for _ in range(self.repeat):
+            # train step (observe costs)
+            try: 
+                x, y = next(self.dl)
+            except StopIteration: 
+                self.dl = iter(self.train_dl)
+                x, y = next(self.dl)
+            x = x.to(device); y = y.to(device)
+            self.opt.zero_grad()
+            train_loss = self.loss_fn(self.model(x), y)
+            train_loss.backward()
+            self.opt.step()
+            tloss += train_loss.item()
+        tloss /= self.repeat
         
         # update stats
-        self.stats.update('train losses', train_loss, t=self.t)
+        self.episode_trainlosses.append(tloss)
+        self.stats.update('train losses', tloss, t=self.t)
+        self.stats.update('avg train losses since reset', np.mean(self.episode_trainlosses), t=self.t)
         try:
             self.stats.update('lrs', self.opt.param_groups[0]['lr'], t=self.t)
             self.stats.update('momenta', float(self.opt.param_groups[0]['momentum']), t=self.t)
@@ -119,11 +133,16 @@ class NNTraining(DynamicalSystem):
                     x = x.to(device); y = y.to(device)
                     val_loss += self.loss_fn(self.model(x), y)
                 val_loss /= len(self.val_dl)
-                self.stats.update('val losses', val_loss.item(), t=self.t)
+                val_loss = val_loss.item()
+                self.episode_vallosses.append(val_loss)
+                self.stats.update('val losses', val_loss, t=self.t)
+                self.stats.update('avg val losses since reset', np.mean(self.episode_vallosses), t=self.t)
             self.model.train()
             
         self.t += 1
-        return train_loss, None
+        self.episode_t += 1
+
+        return tloss, None
 
 class LinearRegression(NNTraining):
     """
@@ -134,15 +153,13 @@ class LinearRegression(NNTraining):
                  make_optimizer: Callable[[torch.nn.Module], torch.optim.Optimizer], 
                  apply_control: Callable[[jnp.ndarray, DynamicalSystem], None],
                  dataset: str = 'diabetes',
+                 repeat: int = 1,
                  eval_every: int = None,
                  seed: int = None,
                  stats: Stats = None):
         
         set_seed(seed)  # for reproducibility
-
-        self.eval_every = eval_every
         self.OBSERVABLE = False
-        self.apply_control = apply_control
 
         # data
         assert dataset in ['california', 'diabetes', 'generated']
@@ -159,29 +176,27 @@ class LinearRegression(NNTraining):
         train_y = torch.FloatTensor(train_y, device=device).reshape(-1, 1)
         val_x = torch.FloatTensor(val_x, device=device)
         val_y = torch.FloatTensor(val_y, device=device).reshape(-1, 1)
-        self.train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=train_x.shape[0], shuffle=False)
-        self.val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=val_x.shape[0], shuffle=False)
-        self.dl = iter(self.train_dl)
+        train_dl = DataLoader(TensorDataset(train_x, train_y), batch_size=train_x.shape[0], shuffle=False)
+        val_dl = DataLoader(TensorDataset(val_x, val_y), batch_size=val_x.shape[0], shuffle=False)
+        dl = iter(train_dl)
         
         # model
-        self.model = torch.nn.Linear(train_x.shape[1], 1).float()
-        self.opt = make_optimizer(self.model)
-        self.model.train().to(device)
+        model = torch.nn.Linear(train_x.shape[1], 1).float()
+        opt = make_optimizer(model)
+        model.train().to(device)
         
         # losses
-        self.loss_fn = self.eval_fn = lambda yhat, y: torch.nn.functional.mse_loss(yhat, y)
+        loss_fn = eval_fn = lambda yhat, y: torch.nn.functional.mse_loss(yhat, y)
         
-        # stats to keep track of
-        self.t = 0
+        # stats
         if stats is None:
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
-        self.stats = stats
-        self.stats.register('train losses', float, plottable=True)
-        self.stats.register('val losses', float, plottable=True)
-        self.stats.register('lrs', float, plottable=True)
-        self.stats.register('momenta', float, plottable=True)
             
+        super().__init__(stats=stats, model=model, opt=opt, apply_control=apply_control, 
+                                         train_dl=train_dl, val_dl=val_dl, dl=dl,
+                                         loss_fn=loss_fn, eval_fn=eval_fn, 
+                                         repeat=repeat, eval_every=eval_every)
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass
         
@@ -195,60 +210,50 @@ class MNIST(NNTraining):
                  apply_control: Callable[[jnp.ndarray, DynamicalSystem], None],
                  model_type: str = 'MLP',
                  batch_size: int = 128,
+                 repeat: int = 1,
                  eval_every: int = None,
                  seed: int = None,
                  stats: Stats = None):
         
         set_seed(seed)  # for reproducibility
-       
-        # needs to set the following things
-        self.apply_control: Callable[[jnp.ndarray, DynamicalSystem],] = None  # applies the control to the system (which might update the learning rate or momentum or something)
-        self.loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
-        self.eval_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]  # loss(yhat, y)
-        
-        self.eval_every = eval_every
         self.OBSERVABLE = False
-        self.apply_control = apply_control
 
         # data
-        self.train_dl = DataLoader(
+        train_dl = DataLoader(
             torchvision.datasets.MNIST('.data', train=True, download=True,
                            transform=torchvision.transforms.Compose([
                                torchvision.transforms.ToTensor(),
                                torchvision.transforms.Normalize((0.1307,), (0.3081,))
                            ])),
             batch_size=batch_size, shuffle=True, drop_last=True)
-        self.val_dl = DataLoader(
+        val_dl = DataLoader(
             torchvision.datasets.MNIST('./data', train=False, download=True,
                            transform=torchvision.transforms.Compose([
                                torchvision.transforms.ToTensor(),
                                torchvision.transforms.Normalize((0.1307,), (0.3081,))
                            ])),
             batch_size=batch_size, shuffle=False, drop_last=True)
-        self.dl = iter(self.train_dl)
+        dl = iter(train_dl)
         
         # model
         assert model_type in ['MLP', 'CNN']
-        if model_type == 'MLP':
-            self.model = MLP(layer_dims=[int(28 * 28), 100, 100, 10]).float()
-        elif model_type == 'CNN':
-            self.model = CNN(input_shape=(28, 28), output_dim=10)
-        self.opt = make_optimizer(self.model)
-        self.model.train().to(device)  
+        if model_type == 'MLP': model = TorchMLP(layer_dims=[int(28 * 28), 100, 100, 10]).float()
+        elif model_type == 'CNN': model = TorchCNN(input_shape=(28, 28), output_dim=10)
+        opt = make_optimizer(model)
+        model.train().to(device)  
         
         # losses
-        self.loss_fn = self.eval_fn = lambda yhat, y:  torch.nn.functional.nll_loss(yhat.softmax(dim=-1).log(), y)
-        
-        # stats to keep track of
-        self.t = 0
+        loss_fn = eval_fn = lambda yhat, y:  torch.nn.functional.nll_loss(yhat.softmax(dim=-1).log(), y)
+
+        # stats
         if stats is None:
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(str(self.__class__).split('.')[-1]))
             stats = Stats()
-        self.stats = stats
-        self.stats.register('train losses', float, plottable=True)
-        self.stats.register('val losses', float, plottable=True)
-        self.stats.register('lrs', float, plottable=True)
-        self.stats.register('momenta', float, plottable=True)
+        
+        super().__init__(stats=stats, model=model, opt=opt, apply_control=apply_control, 
+                                         train_dl=train_dl, val_dl=val_dl, dl=dl,
+                                         loss_fn=loss_fn, eval_fn=eval_fn, 
+                                         repeat=repeat, eval_every=eval_every)
         
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass    
@@ -291,13 +296,12 @@ class LDS(DynamicalSystem):
             matrix for quadratic control costs (i.e. `cost = cost_fn(x) + u^T @ R @ u`), by default
         """
         set_seed(seed)  # for reproducibility
-        
         self.OBSERVABLE = True
         
         # figure out dynamics
         self.state_dim = state_dim
         self.control_dim = control_dim
-        A, B, _ = drss(n=self.state_dim, p=self.control_dim, m=0)  # random discrete, stable system
+        A, B = random_lds(state_dim=self.state_dim, control_dim=self.control_dim)  # random discrete, stable system
         self.A, self.B = jnp.array(A).reshape(state_dim, state_dim), jnp.array(B).reshape(state_dim, control_dim)
         assert self.A.shape == (state_dim, state_dim) and self.B.shape == (state_dim, control_dim)
         
@@ -320,7 +324,8 @@ class LDS(DynamicalSystem):
             cost_fn = cost_fns[cost_fn]
         self.R = R if R is not None else jnp.identity(control_dim)
         assert self.R.shape == (control_dim, control_dim)
-        self.cost_fn = lambda x, u: cost_fn(x) + u.T @ self.R @ u
+        self.cost_fn = lambda x, u: cost_fn(x) #+ u.T @ self.R @ u
+        logging.info('(LDS) for the LDS we are !!!NOT!!! reporting the costs with the `u.T @ R @ u` part')
         
         # figure out stats to keep track of
         self.t = 0
@@ -329,12 +334,7 @@ class LDS(DynamicalSystem):
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('xs', jnp.ndarray, plottable=True)
-        self.stats.register('us', jnp.ndarray, plottable=True)
-        self.stats.register('ws', float, plottable=True)
-        self.stats.register('fs', float, plottable=True)
-        self.stats.register('avg fs', float, plottable=True)
-        self.stats.register('avg fs since last reset', float, plottable=True, use_special_prefixes=False)
+        self.stats.register('true disturbances', obj_class=float)
         
         # figure out init
         self.initial_state = jax.random.normal(jkey(), (state_dim,))
@@ -362,11 +362,7 @@ class LDS(DynamicalSystem):
         
         # update
         self.episode_fs.append(cost)
-        self.stats.update('xs', self.state, t=self.t)
-        self.stats.update('us', control, t=self.t)
-        self.stats.update('ws', disturbance, t=self.t)
-        self.stats.update('fs', cost, t=self.t)
-        self.stats.update('avg fs since last reset', np.mean(self.episode_fs), t=self.t)
+        self.stats.update('true disturbances', disturbance, t=self.t)
         self.state = state
         self.t += 1
         
@@ -390,7 +386,7 @@ class COCO(LDS):
         idxs = jnp.arange(self.problem.dimension)[:dim]
         
         A = jnp.identity(dim) if predict_differences else jnp.zeros((dim, dim))
-        B = jnp.identity(dim) 
+        B = jnp.identity(dim)
         R = jnp.identity(dim) # jnp.zeros((dim, dim))
         
         super().__init__(dim, dim, disturbance_type, None, A, B, R, seed, stats)    
@@ -431,6 +427,7 @@ class Gym(DynamicalSystem):
     def __init__(self, 
                  env_name: str,
                  use_reward_costs: bool = False,
+                 send_done: bool = False,  # whether to send the string `'done'` as the state in `self.interact()` if we finished an episode
                  repeat: int = 1,
                  render: bool = False,
                  max_episode_len: int = None,
@@ -438,9 +435,11 @@ class Gym(DynamicalSystem):
                  stats: Stats = None):
 
         set_seed(seed)  # for reproducibility
+        self.OBSERVABLE = True
         self.repeat = repeat
         self.render = render
         self.use_reward_costs = use_reward_costs
+        self.send_done = send_done
         self.max_episode_len = max_episode_len
         self.reset_seed = seed
         
@@ -450,13 +449,13 @@ class Gym(DynamicalSystem):
             self.env = ContinuousCartPoleEnv()
             if render: logging.warning('({}) i havent yet set up rendering for continuous cartpole :)'.format(get_classname(self)))
         else: self.env = gym.make(env_name, render_mode='human' if render else None)
+        self.env_name = env_name
         self.state_dim = self.env.observation_space.shape[0]
         self.control_dim = self.env.action_space.shape[0] if self.continuous_action_space else 1
         
         if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda state: abs(0.45 - state[0])  # L1 distance from flag
-        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: 
-            self.cost_fn = lambda state: abs(state[2]) if state[2] > 0 else (state[2] ** 2)  # MSE of pole angle
-            logging.warn('!!!!!!WARNING!!!!!!! using asymmetric cost fn for cartpole because I was testing that one thing')
+        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: self.cost_fn = lambda state: state[2] ** 2  # MSE of pole angle
+        elif env_name == 'Pendulum-v1': self.cost_fn = lambda state: (jnp.arctan2(state[1], state[0]) ** 2).item() + 0.1 * state[2].item() ** 2  # taken from https://gymnasium.farama.org/environments/classic_control/pendulum/
         else: raise NotImplementedError(env_name)
         self.initial_state, _ = self.env.reset()
         self.reset(self.reset_seed)
@@ -467,12 +466,8 @@ class Gym(DynamicalSystem):
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        if self.state_dim == 1: self.stats.register('xs', float, plottable=True)
-        if self.control_dim == 1 or not self.continuous_action_space: self.stats.register('us', float, plottable=True)
-        self.stats.register('fs', float, plottable=True)
-        self.stats.register('avg fs', float, plottable=True)
-        self.stats.register('rewards', float, plottable=True)
-        self.stats.register('avg rewards', float, plottable=True)
+        self.stats.register('fs', obj_class=float)
+        self.stats.register('rewards', obj_class=float)
         pass
         
     def reset(self, seed: int = None):
@@ -492,26 +487,33 @@ class Gym(DynamicalSystem):
         given control, returns cost and an observation. The observation may be the true state, a function of the state, or simply `None`
         """
         if self.continuous_action_space: assert control.shape == (self.control_dim,), control.shape
-        if self.done: 
-            self.reset(self.reset_seed)
+        if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
+        if self.done: self.reset(self.reset_seed)
 
         control = np.array(control)
-        for _ in range(self.repeat):
+        if self.env_name == 'CartPoleContinuous-v1': control = np.clip(control, -1, 1)
+        
+        cost = 0.
+        for i in range(self.repeat):
             if self.max_episode_len is not None and self.episode_t > self.max_episode_len: self.done = True
             if self.done: break
-            self.state, r, self.done, _, _ = self.env.step(control if self.continuous_action_space else control.item())
+            self.state, r, self.done, _, _ = self.env.step(control)# if self.continuous_action_space else control.item())
             self.episode_reward += r
+            cost += self.cost_fn(self.state)
             self.episode_t += 1
-        cost = -self.episode_reward if self.use_reward_costs else self.cost_fn(self.state)
+        cost /= (i + 1)
+        print(cost)
 
         # update
-        if self.state_dim == 1: self.stats.update('xs', self.state.item(), t=self.t)
-        if self.control_dim == 1 or not self.continuous_action_space: self.stats.update('us', float(control.item()), t=self.t)
         self.stats.update('fs', cost, t=self.t)
         self.stats.update('rewards', self.episode_reward, t=self.t)
         self.t += 1
         
-        return cost, jnp.array(self.state) if not self.done else 'done'
+        state = jnp.array(self.state)
+        if self.use_reward_costs: cost = -self.episode_reward
+        if self.done and self.send_done: state = 'done'
+        
+        return cost, state
 
 
 class PIDGym(DynamicalSystem):
@@ -528,6 +530,8 @@ class PIDGym(DynamicalSystem):
                  seed: int = None,
                  stats: Stats = None):
         
+        set_seed(seed)
+        self.OBSERVABLE = False
         self.apply_control = apply_control
         self.control_dim = control_dim
         self.repeat = repeat
@@ -536,7 +540,8 @@ class PIDGym(DynamicalSystem):
         # env
         gym_args = {
             'env_name': env_name,
-            'use_reward_costs': True,
+            'use_reward_costs': False,
+            'send_done': True,
             'repeat': gym_repeat,
             'render': False,
             'max_episode_len': max_episode_len,
@@ -564,10 +569,7 @@ class PIDGym(DynamicalSystem):
         self.pid = PID(**pid_args)
         self.reset(seed)
         
-        # stats to keep track of
         self.t = 0
-        self.episode_rewards = []
-        self.stats.register('avg rewards since reset', float, plottable=True, use_special_prefixes=False)
         pass
 
     def reset(self, seed: int = None):
@@ -575,8 +577,8 @@ class PIDGym(DynamicalSystem):
         to reset an episode, which should send state back to init
         """
         # for reproducibility
+        set_seed(seed)
         self.gym.reset(seed)
-        self.episode_rewards = []
         self.state = None
     
         # reset controller history
@@ -591,6 +593,7 @@ class PIDGym(DynamicalSystem):
             
         # apply control
         self.apply_control(control, self)
+        costs = 0.
         for _ in range(self.repeat):
             action = self.pid.get_control(None, self.state) if self.state is not None else self.gym.env.action_space.sample()
             
@@ -600,19 +603,17 @@ class PIDGym(DynamicalSystem):
                 action = 1 if action > 0 else 0
 
             cost, state = self.gym.interact(action)
+            costs += cost
             if state == 'done':
                 self.state = None
                 self.pid.reset(self.seed)
                 break
             else:
                 self.state = state
-        
-        # update stats
-        self.stats.update('avg rewards since reset', np.mean(self.episode_rewards) if len(self.episode_rewards) > 0 else 0., t=self.t)
-        self.episode_rewards.append(-cost)
+        costs /= self.repeat
         self.t += 1
         
-        return cost, None
+        return costs, None
         
         
 class PPOGym(DynamicalSystem):
@@ -632,6 +633,7 @@ class PPOGym(DynamicalSystem):
         
         set_seed(seed)  # for reproducibility
         
+        self.OBSERVABLE = False
         self.apply_control = apply_control
         self.repeat = repeat
         self.control_dim = control_dim
@@ -644,6 +646,7 @@ class PPOGym(DynamicalSystem):
             'repeat': gym_repeat,
             'render': False,
             'max_episode_len': max_episode_len,
+            'send_done': True,
             'seed': seed,
             'stats': stats,
         }
@@ -659,19 +662,13 @@ class PPOGym(DynamicalSystem):
             'gamma': gamma,
             'eps_clip': eps_clip,
             'has_continuous_action_space': 'continuous' in env_name.lower(),
+            'stats': self.stats,
         }
         self.ppo = PPO(**ppo_args)
-        self.reset(self.seed)
         assert not self.ppo.continuous_action_space, 'i havent yet coded continuous PPO'
         
-        # stats to keep track of
-        self.t = 0
-        self.episode_costs = []
-        if stats is None:
-            logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
-            stats = Stats()
-        self.stats = stats
-        self.stats.register('avg rewards since reset', float, plottable=True, use_special_prefixes=False)
+        self.reset(seed)
+        self.t = 0        
         pass
     
     def reset(self, seed: int = None):
@@ -679,8 +676,8 @@ class PPOGym(DynamicalSystem):
         to reset an episode, which should send state back to init
         """
         # for reproducibility
+        set_seed(seed)
         self.gym.reset(seed)
-        self.episode_rewards = []
         self.state = None
         self.cost = None
 
@@ -705,10 +702,6 @@ class PPOGym(DynamicalSystem):
                 break
             self.cost, self.state = self.gym.interact(action)
         
-        # update stats
-        self.stats.update('avg rewards since reset', np.mean(self.episode_rewards) if len(self.episode_rewards) > 0 else 0., t=self.t)
-        self.episode_rewards.append(-self.cost)
         self.t += 1
-        
         return self.cost, None
         

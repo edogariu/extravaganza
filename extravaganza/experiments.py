@@ -1,10 +1,11 @@
 import logging
-from typing import Any, Callable, Dict
+from typing import Callable, Dict
 from collections import defaultdict
 import tqdm
 import random
 import time
 import matplotlib.pyplot as plt
+from copy import deepcopy
 import dill
 from dill.source import getsource
 import traceback
@@ -20,6 +21,7 @@ import jax.numpy as jnp
 
 from extravaganza.controllers import Controller
 from extravaganza.dynamical_systems import DynamicalSystem
+from extravaganza.observables import Trajectory, Observable, TimeDelayedObservation
 from extravaganza.stats import Stats
 from extravaganza.utils import set_seed, get_color
 
@@ -45,8 +47,6 @@ class Experiment:
             get_args = args[0]
             assert isinstance(get_args, Callable)
             self.get_args = get_args
-            
-        if self.get_args is not None:
             experiment_args = self.get_args()
             stats = self._run_experiment(**experiment_args)
         else:
@@ -81,23 +81,31 @@ class Experiment:
         logging.info('(EXPERIMENT) loaded experiment from `{}`'.format(filename))
         return exp
     
-    
     def _run_trial(self,
                   make_system: Callable[[], DynamicalSystem],
-              make_controller: Callable[[DynamicalSystem], Controller],
-              T: int, 
-              reset_condition: Callable[[int], bool] = lambda t: False,
-              reset_seed: int = None,
-              render_every: int = None,
-              append_list: list = None,
-              id: str = None,  # for labeling in the renderer
-              seed: int = None) -> Stats:
+                  make_controller: Callable[[DynamicalSystem], Controller],
+                  observable: Observable,
+                  T: int, 
+                  reset_condition: Callable[[int], bool] = lambda t: False,
+                  reset_seed: int = None,
+                  render_every: int = None,
+                  append_list: list = None,
+                  id: str = None,  # for labeling in the renderer
+                  seed: int = None) -> Stats:
         try:
             set_seed(meta_seed=seed)
             
             # make system and controller
             system = make_system()
+            if not system.OBSERVABLE: assert isinstance(observable, TimeDelayedObservation), observable.__class__
             controller = make_controller(system)
+            
+            # handle stats
+            stats = Stats()
+            stats.register('costs', obj_class=float)
+            stats.register('controls', obj_class=jnp.ndarray, shape=(controller.control_dim,))
+            stats.register('observations', obj_class=jnp.ndarray, shape=(observable.obs_dim,))
+            stats.register('true states')  # we don't know apriori if the states will be arrays, None, strings, ???
             
             # initial control
             control = controller.initial_control if hasattr(controller, 'initial_control') else jnp.zeros(controller.control_dim)  
@@ -142,13 +150,33 @@ class Experiment:
                     
             # run trial
             pbar = tqdm.trange(T) if append_list is None else range(T)
+            traj = Trajectory()
+            # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
+            cost, obs = 0., jnp.zeros(observable.obs_dim)
             for t in pbar:
-                if reset_condition(t):
-                    logging.info('(EXPERIMENT): reset!')
+                if t == 0 or reset_condition(t):
+                    logging.info('(EXPERIMENT): reset at t={}!'.format(t))
                     system.reset(reset_seed)
+                    controller.system_reset_hook()
+                    traj = Trajectory()
+                    # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
+                    pass
                     
-                cost, state = system.interact(control)  # state will be `None` for unobservable systems
-                control = controller.get_control(cost, state)
+                next_cost, next_state = system.interact(control)  # state will be `None` for unobservable systems
+                traj.add_state(next_cost, next_state)
+                next_obs = observable(traj)
+                
+                controller.update(obs, cost, control, next_obs, next_cost)
+                cost, state, obs = next_cost, next_state, next_obs
+
+                # log things
+                stats.update('costs', cost, t=t)
+                stats.update('controls', control, t=t)
+                stats.update('observations', obs, t=t)
+                stats.update('true states', state, t=t)  # we don't know apriori if the states will be arrays, None, strings, ???
+
+                control = controller.get_control(cost, obs)
+                traj.add_control(control)
                     
                 render(t, cost, state)
                 
@@ -166,7 +194,7 @@ class Experiment:
                             counter.value += 1
                     return None
                 
-            stats = Stats.concatenate((system.stats, controller.stats))
+            stats = Stats.concatenate((system.stats, controller.stats, stats))
             if append_list is not None: 
                 lock = append_list._mutex
                 lock.acquire()
@@ -187,6 +215,7 @@ class Experiment:
     def _run_experiment(self,
                        make_system: Callable[[], DynamicalSystem],
                    make_controllers: Dict[str, Callable[[DynamicalSystem], Controller]],
+                   observable: Observable,
                    num_trials: int,
                    T: int,
                    reset_condition: Callable[[int], bool] = lambda t: False,
@@ -209,7 +238,7 @@ class Experiment:
             for t in range(num_trials):
                 for k, controller_func in make_controllers.items():
                     if k not in stats_dict: stats_dict[k] = man.list()
-                    for i, v in enumerate([make_system, controller_func, T, reset_condition, reset_seed, render_every, stats_dict[k], k, random.randint(0, 10000)]): 
+                    for i, v in enumerate([make_system, controller_func, observable, T, reset_condition, reset_seed, render_every, stats_dict[k], k, random.randint(0, 10000)]): 
                         args[i].append(v)
                 
             ncpu = os.cpu_count()
@@ -234,7 +263,7 @@ class Experiment:
                 logging.info('(EXPERIMENT) --------------------------------------------------\n')
                 for k, controller_func in make_controllers.items():
                     logging.info('(EXPERIMENT): testing {}'.format(k))
-                    s = self._run_trial(make_system, controller_func, T, reset_condition, reset_seed, render_every=render_every, id=k)
+                    s = self._run_trial(make_system, controller_func, observable, T, reset_condition, reset_seed, render_every=render_every, id=k)
                     if s is not None: stats[k].append(s)
                     logging.info('')
             if len(stats) == 0:
@@ -245,3 +274,12 @@ class Experiment:
 
         logging.info('(EXPERIMENT) done! The entire experiment took {} seconds'.format(time.perf_counter() - start_time))
         return stats
+
+    def __getitem__(self, key):
+            if isinstance(key, slice):  # for slice interface!!
+                ret = deepcopy(self)
+                for k in ret.stats.keys():
+                    ret.stats[k] = ret.stats[k][key]
+                return ret
+            else:
+                raise TypeError('Invalid argument type: {}'.format(type(key)))

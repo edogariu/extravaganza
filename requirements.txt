@@ -4,6 +4,8 @@ torch
 torchvision
 jax
 jaxlib
+flax
+optax
 tqdm
 scikit-learn
 matplotlib
@@ -13,6 +15,7 @@ gymnasium[classic-control]
 deluca
 dill
 pytorch-metric-learning
+info-nce-pytorch
 seaborn
 
 # things for pykoopman

@@ -1,20 +1,88 @@
-from typing import List, Iterable
+from typing import List, Iterable, Callable
+
+from extravaganza.utils import set_seed, jkey
+
+#  ============================================================================================
+#  ============================================================================================
+#  ===========================================  JAX  ==========================================
+#  ============================================================================================
+#  ============================================================================================
+
+import jax.numpy as jnp
+import flax.linen as jnn
+
+class JaxMLP(jnn.Module):
+    """
+    made using the tutorial found at:
+        https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial2/Introduction_to_JAX.html
+    """
+    
+    layer_dims: List[int]   # dims of each layer
+    activation: jnn.Module = jnn.activation.relu
+    normalization: jnn.Module = None  # normalize before the activation
+    drop_last_activation: bool = True
+    use_bias: bool = True
+    seed: int = None
+        
+    def setup(self):  # create the modules to build the network
+        set_seed(self.seed)
+        
+        self.input_dim = self.layer_dims[0]
+        self.output_dim = self.layer_dims[-1]
+        
+        layers = []
+
+        for i in range(len(self.layer_dims) - 1):
+            in_dim, out_dim = self.layer_dims[i: i + 2]
+            layers.append(jnn.Dense(features=out_dim, use_bias=self.use_bias))
+            if self.normalization is not None: layers.append(self.normalization())
+            layers.append(self.activation)
+        if self.drop_last_activation: 
+            layers.pop()  # removes activation from final layer
+            if self.normalization is not None: layers.pop()  # removes normalization too
+        
+        self.model = jnn.Sequential(layers)
+        pass
+    
+    def __call__(self, x: jnp.ndarray):  # forward pass
+        x = x.reshape(-1, self.layer_dims[0])
+        x = self.model(x)
+        return x
+    
+def get_jax_mlp(layer_dims: List[int],
+                activation: jnn.Module = jnn.activation.relu,
+                normalization: jnn.Module = None,  # normalize before the activation
+                drop_last_activation: bool = True,
+                use_bias: bool = True,
+                seed: int = None):
+    
+    model = JaxMLP(layer_dims=layer_dims, activation=activation, normalization=normalization, drop_last_activation=drop_last_activation, use_bias=use_bias, seed=seed)
+    params = model.init(jkey(), jnp.zeros((1, layer_dims[0])))
+    return model, params
+
+
+
+#  ============================================================================================
+#  ============================================================================================
+#  =========================================  PYTORCH  ========================================
+#  ============================================================================================
+#  ============================================================================================
 
 import torch
 import torch.nn as nn
+from info_nce import InfoNCE
+from pytorch_metric_learning.losses import ContrastiveLoss, SelfSupervisedLoss, SupConLoss
 
-from extravaganza.utils import set_seed
-
-class MLP(nn.Module):
+class TorchMLP(nn.Module):
     def __init__(self, 
                  layer_dims: List[int], 
                  activation: nn.Module = nn.ReLU,
                  normalization: nn.Module = nn.Identity,  # normalize before the activation
                  drop_last_activation: bool = True,
-                 use_bias = True,
+                 use_bias: bool = True,
                  seed: int = None):
         """
-        Creates a MLP to use as a weak learner
+        Creates a TorchMLP to use as a weak learner
 
         Parameters
         ----------
@@ -24,13 +92,14 @@ class MLP(nn.Module):
             activation function, by default nn.ReLU
         """
         
-        super(MLP, self).__init__()
+        super(TorchMLP, self).__init__()
         set_seed(seed)
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.input_dim = layer_dims[0]
         self.output_dim = layer_dims[-1]
+        self.use_bias = use_bias
         
         self.layers = [nn.Flatten(1)]
         for i in range(len(layer_dims) - 1):
@@ -47,14 +116,14 @@ class MLP(nn.Module):
         return h
     
     
-class CNN(nn.Module):
+class TorchCNN(nn.Module):
     def __init__(self, 
                  input_shape: Iterable,  # should be in CxHxW
                  output_dim: int,
                  activation: nn.Module=nn.ReLU,
                  use_bias=True,
                  seed: int = None):
-        super(CNN, self).__init__()
+        super(TorchCNN, self).__init__()
         set_seed(seed)
         
         assert len(input_shape) in [2, 3]
@@ -89,18 +158,108 @@ class CNN(nn.Module):
             feature_size = self.body(torch.zeros(1, *self.input_shape)).view(1, -1).shape[1]
         return feature_size
 
+class TorchAutoencoder(nn.Module):
+    def __init__(self, 
+                 layer_dims: List[int], 
+                 activation: nn.Module = nn.ReLU,
+                 normalization: nn.Module = nn.Identity,  # normalize before the activation
+                 drop_last_activation: bool = True,
+                 use_bias: bool = True,
+                 seed: int = None):
+        super().__init__()
+        self.encoder = TorchMLP(layer_dims=layer_dims, 
+                                activation=activation, 
+                                normalization=normalization, 
+                                drop_last_activation=drop_last_activation, 
+                                use_bias=use_bias, 
+                                seed=seed)
+        self.decoder = TorchMLP(layer_dims=layer_dims[::-1],
+                                activation=activation,
+                                normalization=nn.Identity,
+                                drop_last_activation=True,
+                                use_bias=True,
+                                seed=seed)
+        # import logging; logging.warning('GUYS IM DOING THE SPHERE * COST EMBEDDING!!!! WATCH OUT!!! :)')
+        pass
+    
+    def encode(self, x): 
+        emb = self.encoder(x)
+        # emb = emb / torch.linalg.norm(emb, dim=-1).unsqueeze(dim=-1)  # proj to unit sphere
+        # emb = emb * 50 * torch.abs(x[:, 2]).unsqueeze(dim=-1)  # proj to cost sphere
+        return emb
+    
+    def decode(self, z): return self.decoder(z)
+    
+class TorchPC3(nn.Module):
+    def __init__(self, 
+                 encoder: TorchMLP,
+                 dynamics_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],  # deterministic dynamics F(x_t, u_t)
+                 x_dim: int,
+                 u_dim: int,
+                 z_dim: int,
+                 sigma: float = 0,
+                 determinstic_encoder: bool = False):
+        super().__init__()
+
+        self.encoder = encoder
+        assert encoder.input_dim == x_dim, 'inconsistent dims'
+        self.dynamics_fn = dynamics_fn
+        
+        self.obs_dim, self.state_dim, self.control_dim = x_dim, z_dim, u_dim
+        self.sigma = sigma
+        
+        self.mu = nn.Linear(self.encoder.output_dim, z_dim)
+        self.logvar = nn.Linear(self.encoder.output_dim, z_dim) if not determinstic_encoder else None
+        
+        """
+        Contrastive predictive coding, see https://arxiv.org/pdf/1807.03748.pdf.
+        """
+        self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
+        # self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=True)
+        pass
+        
+    def encode(self, x: torch.Tensor): 
+        unbatch = x.ndim == 1
+        if unbatch: x = x.unsqueeze(0)
+        assert x.shape[1] == self.obs_dim, (x.shape, self.obs_dim)
+        z = self.encoder(x)
+        enc = self.mu(z)
+        if self.logvar is not None:  # actually sample from trained distribution
+            logvar = self.logvar(z)
+            enc = enc + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
+        assert enc.shape[1] == self.state_dim, (enc.shape, self.state_dim)
+        if unbatch: enc = enc.squeeze(0)
+        return enc
+    
+    
+    def get_embs_and_losses(self, obs, control, next_obs): 
+        assert control.ndim == 2 and control.shape[1] == self.control_dim, (control.shape, self.control_dim)
+
+        zprev, z = self.encode(obs), self.encode(next_obs)
+        zhat = self.dynamics_fn(zprev, control)
+        
+        # perturb the next state encoding, see Section 4.2 of PC3 paper
+        if self.sigma > 0: z = z + self.sigma * torch.randn_like(z)
+        
+        losses = {}
+        losses['linearization'] = ((zhat - z) ** 2).sum(dim=-1).mean(dim=0)  # MSE of linear latent next state prediction
+        losses['cpc'] = self.cpc_loss(z, zhat, zprev)  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
+        # losses['cpc'] = self.cpc_loss(z, zhat)
+        return (zprev, z, zhat), losses
+    
+
 if __name__ == '__main__':
     print('testing model dimension stuff!')
-    _mlp = MLP([128, 256, 128, 64, 16])
-    _mlp_test = torch.zeros((1, 128))
-    assert _mlp(_mlp_test).shape[1] == 16
+    _TorchMLP = TorchMLP([128, 256, 128, 64, 16])
+    _TorchMLP_test = torch.zeros((1, 128))
+    assert _TorchMLP(_TorchMLP_test).shape[1] == 16
     
-    _cnn = CNN(input_shape=(3, 210, 160), output_dim=16)
-    _cnn_test = torch.zeros((1, 3, 210, 160))
-    assert _cnn(_cnn_test).shape[1] == 16
+    _TorchCNN = TorchCNN(input_shape=(3, 210, 160), output_dim=16)
+    _TorchCNN_test = torch.zeros((1, 3, 210, 160))
+    assert _TorchCNN(_TorchCNN_test).shape[1] == 16
     print('yippee!')
     
     from testing.utils import count_parameters
-    mlp = MLP(layer_dims=[int(28 * 28), 100, 100, 100, 100, 10]).float()
-    cnn = CNN(input_shape=(28, 28), output_dim=10)
-    print(count_parameters(mlp), count_parameters(cnn))
+    TorchMLP = TorchMLP(layer_dims=[int(28 * 28), 100, 100, 100, 100, 10]).float()
+    TorchCNN = TorchCNN(input_shape=(28, 28), output_dim=10)
+    print(count_parameters(TorchMLP), count_parameters(TorchCNN))

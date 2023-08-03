@@ -1,12 +1,16 @@
 import logging
+from typing import List
 import random
 import scipy.optimize as optimize
-from scipy.linalg import solve_discrete_are
+from scipy.linalg import solve_discrete_are, orth
+import math
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 import torch
 import torch.nn as nn
+
 import gymnasium as gym
 
 # for rendering
@@ -28,9 +32,11 @@ COLORS = {
           # our methods
           'No Lift': 'm',
           'Random Lift': 'k',
-          'Learned Lift': 'c'}
+          'Learned Lift': 'c',
+          'Linear': 'brown',
+          'Lifted': 'm'}
 
-SAMPLING_METHOD = 'ball'  # must be in `['ball', 'sphere', 'rademacher']``
+SAMPLING_METHOD = 'ball'  # must be in `['ball', 'sphere', 'rademacher', 'normal']``
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def render(experiment, xkey, ykey, sliderkey: str = None, save_path: str = None, duration: float = 5, fps: int = 30):
@@ -103,6 +109,13 @@ def rescale_ax(ax, x, y, margin = 0.08, ignore_current_lims: bool = False):
 def get_classname(obj):
     return str(obj.__class__).split('.')[-1].upper()[:-2]
 
+def summarize_lds(A, B):
+    s = ''
+    s += '||A||_op = {}'.format(opnorm(A))
+    s += '\n||B||_F = {}'.format(jnp.linalg.norm(B))
+    s += '\n||A-BK||_op = {}'.format(opnorm(A - B @ dare_gain(A, B)))
+    return s
+
 def opnorm(X):
     if isinstance(X, torch.Tensor):
         return torch.amax(torch.abs(torch.linalg.eigvals(X)))
@@ -113,22 +126,48 @@ def opnorm(X):
     else:
         raise NotImplementedError(X.__class__)
     
-def dare_gain(A, B, Q, R):
+def dare_gain(A, B, Q = None, R = None):    
     if isinstance(A, torch.Tensor):
+        if Q is None: Q = torch.eye(B.shape[0])
+        if R is None: R = torch.eye(B.shape[1])
         P = Riccati.apply(A, B, Q, R)
         K = torch.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)  # compute LQR gain
     elif isinstance(A, np.ndarray):
+        if Q is None: Q = np.eye(B.shape[0])
+        if R is None: R = np.eye(B.shape[1])
         P = solve_discrete_are(A, B, Q, R)
         K = np.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)  # compute LQR gain
     elif isinstance(A, jnp.ndarray):
+        if Q is None: Q = jnp.eye(B.shape[0])
+        if R is None: R = jnp.eye(B.shape[1])
         P = solve_discrete_are(A, B, Q, R)
         K = jnp.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)  # compute LQR gain
     return K
 
-def least_squares(xs: np.ndarray, 
-                  us: np.ndarray, 
-                  max_opnorm: float = None):
+# def method_of_moments(xs: jnp.ndarray, 
+#                       us: jnp.ndarray):
+#     """
+#     runs method of moments to find A, B s.t.
+#         `A @ x_{t} + B @ u_{t} = x_{t+1}`
+#     """
+#     k = int(0.15 * self.t)
+
+#     states = jnp.array(self.state_history)
+#     eps = jnp.array(self.eps_history)
+
+#     # prepare vectors and retrieve B
+#     scan_len = self.t - k - 1 # need extra -1 because we iterate over j = 0, ..., k
+#     N_j = jnp.array([jnp.dot(states[j: j + scan_len].T, eps[:scan_len]) for j in range(k + 1)]) / scan_len
+#     B = N_j[0] # jnp.dot(states[1:].T, eps[:-1]) / (self.t - 1)
+
+#     # retrieve A
+#     C_0, C_1 = N_j[:-1], N_j[1:]
+#     C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-3 * np.identity(self.state_dim))
+#     A = jnp.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
     
+def least_squares(xs: jnp.ndarray, 
+                  us: jnp.ndarray, 
+                  max_opnorm: float = None):
     """
     runs least squares to find A, B s.t.
         `A @ x_{t} + B @ u_{t} = x_{t+1}`
@@ -140,6 +179,15 @@ def least_squares(xs: np.ndarray,
     x_in = xs[:-1]
     x_out = xs[1:]
     u_in = us[:-1]
+    
+    if isinstance(xs, torch.Tensor):
+        assert isinstance(us, torch.Tensor), us.__class__
+        ret = torch.linalg.lstsq(torch.hstack((x_in, u_in)), x_out, rcond=-1).solution
+        A, B = ret[:ds].T, ret[ds:].T
+        return A, B
+    
+    if isinstance(xs, jnp.ndarray): xs = np.array(xs)
+    if isinstance(us, jnp.ndarray): us = np.array(us)
     
     if max_opnorm is None:
         A_B = np.linalg.lstsq(np.hstack((x_in, u_in)), x_out, rcond=-1)[0]
@@ -212,7 +260,7 @@ def set_seed(seed: int = None, meta_seed: int = None):
 def sample(jkey: jax.random.KeyArray, 
            shape,
            sampling_method=SAMPLING_METHOD) -> jnp.ndarray:
-    assert sampling_method in ['ball', 'sphere', 'rademacher']
+    assert sampling_method in ['ball', 'sphere', 'rademacher', 'normal']
     if sampling_method == 'ball':
         v = jax.random.ball(jkey, np.prod(shape), dtype=jnp.float32).reshape(*shape)
     elif sampling_method == 'sphere':
@@ -220,6 +268,8 @@ def sample(jkey: jax.random.KeyArray,
         v = v / jnp.linalg.norm(v)
     elif sampling_method == 'rademacher':
         v = jax.random.rademacher(jkey, shape, dtype=jnp.float32)
+    elif sampling_method == 'normal':
+        v = jax.random.normal(jkey, shape, dtype=jnp.float32)
     assert v.shape == shape, 'needed {} and got {}'.format(shape, v.shape)
     return v
     
@@ -230,34 +280,70 @@ def _arctanh(t):
     assert jnp.all(jnp.abs(t) <= 1), 'must be in `[-1, 1]^n` to take inverse hyperbolic tan'   
     return 0.5 * jnp.log((1 + t) / (1 - t + 1e-8))
 
-def rescale(t, bounds, use_tanh):
+def rescale(t, bounds, use_tanh) -> jnp.ndarray:
     """
     rescales from `[-1, 1] -> [tmin, tmax]`
     
-        `s = clip(t, -1, 1) * (tmax - tmin) / 2 + (tmax + tmin) / 2`
+        `s = (0.5 + clip(t, -1, 1) / 2) * (tmax - tmin) + tmin
     """
     tmin, tmax = bounds
-    if use_tanh: 
-        t = jnp.tanh(t)
-    else: t = jnp.clip(t, -1, 1)
-    t = (tmax - tmin) * t + (tmax + tmin)
-    return t / 2
+    t = jnp.tanh(t) if use_tanh else jnp.clip(t, -1, 1)
+    t = (1 + t) / 2
+    t = (tmax - tmin) * t + tmin
+    return t
 
-def d_rescale(t, bounds, use_tanh):
+def d_rescale(t, bounds, use_tanh) -> jnp.ndarray:
     tmin, tmax = bounds
     d = (tmax - tmin) / 2
     if use_tanh: d *= 1 - jnp.tanh(t) ** 2
     return d
 
-def inv_rescale(s, bounds, use_tanh):
+def inv_rescale(s, bounds, use_tanh) -> jnp.ndarray:
     tmin, tmax = bounds
-    t = (2 * s - tmax - tmin) / (tmax - tmin)
+    t = (s - tmin) / (tmax - tmin)
+    t = jnp.clip(2 * t - 1, -1, 1)
     if use_tanh: 
-        t = jnp.clip(-1, 1)
         t = _arctanh(t)
     return t
 
-def exponential_linspace_int(start, end, num, divisible_by=1):
+# Method to create sinusoidal timestep embeddings, much like positional encodings found in many Transformers
+def timestep_embedding(timesteps, embedding_dim, method='sin', max_period=10000):
+    """
+    Embeds input timesteps
+
+    Parameters
+    ----------
+    timesteps : jnp.ndarray
+        input timesteps
+    embedding_dim : int
+        dimension for each scalar to embed to
+    method : str, optional
+        how to perform embedding, by default 'sin', must be one of `['sin', 'identity']`
+    max_period : int, optional
+        maximum period for sinusoidal embeddings, by default 10000
+    """
+    if not isinstance(timesteps, jnp.ndarray):
+        timesteps = jnp.array(timesteps)
+    if timesteps.ndim == 1: timesteps = timesteps[None]
+    if method == 'sin':
+        half = embedding_dim // 2
+        emb = math.log(max_period) / half
+        emb = jnp.exp(jnp.arange(half, dtype=float) * -emb)
+        emb = timesteps[:, None].astype(float) * emb[None]
+        emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=1)
+
+        if embedding_dim % 2 == 1:  # Zero pad for odd dimensions, ty to https://stackoverflow.com/questions/69453600/inverse-operation-to-padding-in-jax for conversion to jax
+            pad = (0, 1, 0, 0)
+            value = 0.
+            pad = list(zip(*[iter(pad)]*2))
+            pad += [(0, 0)] * (emb.ndim - len(pad))
+            emb = jax.lax.pad(emb, padding_config=[(i, j, 0) for i, j in pad[::-1]], padding_value=jnp.array(value, emb.dtype))
+    elif method == 'identity':
+        emb = jnp.expand_dims(timesteps, axis=-1).expand([*timesteps.shape, embedding_dim])
+        logging.warning('(UTILS): using identity timestep embeddings. not too sure if this is a good idea')
+    return emb.reshape(embedding_dim)
+
+def exponential_linspace_int(start, end, num, divisible_by=1) -> List[int]:
     """Exponentially increasing values of integers."""
     base = np.exp(np.log(end / start) / (num - 1))
     return [int(np.round(start * base**i / divisible_by) * divisible_by) for i in range(num)]
@@ -420,7 +506,6 @@ permalink: https://perma.cc/C9ZM-652R
 Continuous version by Ian Danforth
 """
 
-import math
 from gymnasium import spaces, logger
 from gymnasium.utils import seeding
 import numpy as np
@@ -573,4 +658,101 @@ Any further steps are undefined behavior.
     def close(self):
         if self.viewer:
             self.viewer.close()
-            
+
+def random_lds(
+    state_dim: int, 
+    control_dim: int,
+    obs_dim: int = None, 
+    p_int_first=0.1, p_int_others=0.01, p_repeat=0.05, p_complex=0.5
+):
+    """
+    !!!! I YANKED THIS FROM pykoopman !!!!!
+    uses numpy's PRNG
+    
+    Create a discrete-time, random, stable, linear state space model.
+
+    Args:
+        n (int, optional): Number of states. Default is 2.
+        p (int, optional): Number of control inputs. Default is 2.
+        m (int, optional): Number of output measurements.
+            If m=0, C becomes the identity matrix, so that y=x. Default is 2.
+        p_int_first (float, optional): Probability of an integrator as the first pole.
+            Default is 0.1.
+        p_int_others (float, optional): Probability of other integrators beyond the
+            first. Default is 0.01.
+        p_repeat (float, optional): Probability of repeated roots. Default is 0.05.
+        p_complex (float, optional): Probability of complex roots. Default is 0.5.
+
+    Returns:
+        Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]: A tuple containing the
+        state transition matrix (A), control matrix (B), and measurement matrix (C).
+
+        A (numpy.ndarray): State transition matrix of shape (n, n).
+        B (numpy.ndarray): Control matrix of shape (n, p).
+        C (numpy.ndarray): Measurement matrix of shape (m, n). If m = 0, C is the
+            identity matrix.
+
+    """
+    n, p, m = state_dim, control_dim, obs_dim
+    if obs_dim is None: m = state_dim
+
+    # Number of integrators
+    nint = int(
+        (np.random.rand(1) < p_int_first) + sum(np.random.rand(n - 1) < p_int_others)
+    )
+    # Number of repeated roots
+    nrepeated = int(np.floor(sum(np.random.rand(n - nint) < p_repeat) / 2))
+    # Number of complex roots
+    ncomplex = int(
+        np.floor(sum(np.random.rand(n - nint - 2 * nrepeated, 1) < p_complex) / 2)
+    )
+    nreal = n - nint - 2 * nrepeated - 2 * ncomplex
+
+    # Random poles
+    rep = 2 * np.random.rand(nrepeated) - 1
+    if ncomplex != 0:
+        mag = np.random.rand(ncomplex)
+        cplx = np.zeros(ncomplex, dtype=complex)
+        for i in range(ncomplex):
+            cplx[i] = mag[i] * np.exp(complex(0, np.pi * np.random.rand(1)))
+        re = np.real(cplx)
+        im = np.imag(cplx)
+
+    # Generate random state space model
+    A = np.zeros((n, n))
+    if ncomplex != 0:
+        for i in range(0, ncomplex):
+            A[2 * i : 2 * i + 2, 2 * i : 2 * i + 2] = np.array(
+                [[re[i], im[i]], [-im[i], re[i]]]
+            )
+
+    if 2 * ncomplex < n:
+        list_poles = []
+        if nint:
+            list_poles = np.append(list_poles, np.ones(nint))
+        if any(rep):
+            list_poles = np.append(list_poles, rep)
+            list_poles = np.append(list_poles, rep)
+        if nreal:
+            list_poles = np.append(list_poles, 2 * np.random.rand(nreal) - 1)
+
+        A[2 * ncomplex :, 2 * ncomplex :] = np.diag(list_poles)
+
+    T = orth(np.random.rand(n, n))
+    A = np.transpose(T) @ (A @ T)
+
+    # control matrix
+    B = np.random.randn(n, p)
+    # mask for nonzero entries in B
+    mask = np.random.rand(B.shape[0], B.shape[1])
+    B = np.squeeze(np.multiply(B, [(mask < 0.75) != 0]))
+
+    # Measurement matrix
+    if m == 0:
+        C = np.identity(n)
+    else:
+        C = np.random.randn(m, n)
+        mask = np.random.rand(C.shape[0], C.shape[1])
+        C = np.squeeze(C * [(mask < 0.75) != 0])
+
+    return (A, B, C) if obs_dim is not None else (A, B)
