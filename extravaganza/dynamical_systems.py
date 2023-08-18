@@ -23,6 +23,7 @@ from extravaganza.stats import Stats
 from extravaganza.utils import device, set_seed, jkey, get_classname, ContinuousCartPoleEnv, random_lds
                 
 class DynamicalSystem:
+    reset_hook: Callable = lambda self: None
     
     @abstractmethod
     def __init__(self, seed: int = None, stats: Stats = None):
@@ -38,6 +39,7 @@ class DynamicalSystem:
         to reset an episode, which should send state back to init
         """
         set_seed(seed)  # for reproducibility
+        self.reset_hook()
         return self
     
     @abstractmethod
@@ -92,6 +94,8 @@ class NNTraining(DynamicalSystem):
         self.episode_t = 1
         self.episode_trainlosses = []
         self.episode_vallosses = []
+        
+        self.reset_hook()
         return self
     
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
@@ -346,6 +350,7 @@ class LDS(DynamicalSystem):
         super().reset(seed)
         self.state = self.initial_state.copy()
         self.episode_fs = []
+        self.reset_hook()
         return self
 
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
@@ -420,6 +425,7 @@ class COCO(LDS):
         self.state = state
         # self.state = self.initial_state.copy()
         self.episode_fs = []
+        self.reset_hook()
         return self
 
 
@@ -479,6 +485,7 @@ class Gym(DynamicalSystem):
         self.episode_t = 0
         self.done = False
         self.state, _ = self.env.reset()
+        self.reset_hook()
         return self
     
 
@@ -502,7 +509,6 @@ class Gym(DynamicalSystem):
             cost += self.cost_fn(self.state)
             self.episode_t += 1
         cost /= (i + 1)
-        print(cost)
 
         # update
         self.stats.update('fs', cost, t=self.t)
@@ -583,6 +589,8 @@ class PIDGym(DynamicalSystem):
     
         # reset controller history
         self.pid.reset(seed)
+        
+        self.reset_hook()
         return self
 
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
@@ -683,6 +691,8 @@ class PPOGym(DynamicalSystem):
 
         # reset controller
         self.ppo.reset(seed)
+        
+        self.reset_hook()
         return self
     
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:

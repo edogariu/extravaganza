@@ -7,7 +7,6 @@ from copy import deepcopy
 import numpy as np
 import jax.numpy as jnp
 import torch
-import torch.utils.data as data
 import pykoopman as pk
 
 from extravaganza.controllers import Controller
@@ -19,12 +18,15 @@ from extravaganza.utils import set_seed, jkey, sample, get_classname, least_squa
 KOOPMAN_METHODS = ['polynomial', 'rbf', 'fourier']
 MAX_OPNORM = None  # set this to `None` to have unconstrained opnorm of `A`
 LOSS_WEIGHTS = {
-    'linearization': 1,
-    'cpc': 0.5,
-    'simplification': 0.1,
-    'consistency': 0,
+    'jac': 0,
+    'l2 linearization': 1,
+    'l1 linearization': 0,
+    'reconstruction': 0,
+    'cpc': 0,
+    'guess the control': 0,
+    'simplification': 1,
     'residual centeredness': 0,
-    'centeredness': 1.
+    'centeredness': 0
 }
 
 class SystemModel:
@@ -41,7 +43,6 @@ class SystemModel:
                  stats: Stats = None,
                  seed: int = None):
 
-        for d in [obs_dim, control_dim, state_dim, max_traj_len, *exploration_scales]: assert d > 0
         set_seed(seed)
         
         self.obs_dim: int = obs_dim
@@ -50,19 +51,23 @@ class SystemModel:
         self.initial_control = jnp.zeros(self.control_dim) if initial_control is None else initial_control
         assert self.initial_control.shape == (self.control_dim,)
         
-        assert len(exploration_scales) in [1, self.control_dim]
-        if len(exploration_scales) == 1: exploration_scales = [exploration_scales[0] for _ in range(self.control_dim)]
+        if isinstance(exploration_scales, float): exploration_scales = [exploration_scales for _ in range(self.control_dim)]
         exploration_scales = jnp.array(np.array(exploration_scales))
-        self.exploration_scales: Tuple[float] = exploration_scales
+        assert exploration_scales.shape == (self.control_dim,)
+        self.exploration_scales = exploration_scales
         
         if exploration_bounds is not None:
-            assert len(exploration_bounds) in [1, self.control_dim]
-            if len(exploration_bounds) == 1: exploration_bounds = [exploration_bounds[0] for _ in range(self.control_dim)]
+            if isinstance(exploration_bounds[0], float): 
+                assert len(exploration_bounds) == 2
+                exploration_bounds = [exploration_bounds for _ in range(self.control_dim)]
             exploration_bounds = jnp.array(np.array(exploration_bounds))
-        self.exploration_bounds: Tuple[Tuple[float]] = exploration_bounds
+            assert exploration_bounds.shape == (self.control_dim, 2)
+        self.exploration_bounds = exploration_bounds
         
         self.max_traj_len: int = max_traj_len
         self.trajs: List[Trajectory] = [Trajectory()]
+        
+        for d in [obs_dim, control_dim, state_dim, max_traj_len]: assert d > 0
         
         # stats to keep track of
         self.trained = False
@@ -78,6 +83,7 @@ class SystemModel:
 
         # `control` is always the control played AFTER receiving `obs`
         self.trajs[-1].add_state(cost, obs)
+        
         control = self.exploration_scales * sample(jkey(), shape=(self.control_dim,)) + self.initial_control
         if self.exploration_bounds is not None:
             for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *self.exploration_bounds[i]))
@@ -87,7 +93,7 @@ class SystemModel:
         return control
     
     def end_trajectory(self):
-        if len(self.trajs[-1].f) > 0: self.trajs.append(Trajectory())
+        if len(self.trajs[-1]) > 0: self.trajs.append(Trajectory())
         pass
     
     def concatenate_trajectories(self):
@@ -126,13 +132,12 @@ class Lifter(SystemModel):
                  exploration_scales: Tuple[float],
                  
                  method: str,  # must be in ['identity', 'polynomial', rbf', 'fourier', 'nn']
+                 AB_method: str = 'learned',
                  depth: int = 4,  # depth of NN
                  sigma: float = 0.,
                  determinstic_encoder: bool = False,
                  num_epochs: int = 20,
-                 batch_size: int = 64,
                  lifter_lr: float = 0.001,
-                 sysid_lr: float = 0.001,
                  
                  initial_control: jnp.ndarray = None,
                  exploration_bounds: Tuple[Tuple[float]] = None,
@@ -159,93 +164,133 @@ class Lifter(SystemModel):
 
         elif method == 'nn':
             self.num_epochs = num_epochs
-            self.batch_size = batch_size
             
-            # layer_dims = exponential_linspace_int(self.obs_dim, self.state_dim, depth)
-            mid_dim = self.obs_dim + self.state_dim
+            mid_dim = 10 * (self.obs_dim + self.state_dim)
             layer_dims = [self.obs_dim, *[mid_dim for _ in range(depth - 1)], self.state_dim]
-            mlp = TorchMLP(layer_dims,
+            enc = TorchMLP(layer_dims,
                            activation=torch.nn.ReLU,
-                           #   normalization=torch.nn.LayerNorm,
+                        #    normalization=torch.nn.LayerNorm,
                            drop_last_activation=True,
                            use_bias=True,
                            seed=seed)
-            self.A, self.B = torch.nn.Parameter(torch.eye(self.state_dim)), torch.nn.Parameter(torch.zeros((self.state_dim, self.control_dim)))
-            dynamics_fn = lambda z, u: (self.A @ z.unsqueeze(-1) + self.B @ u.unsqueeze(-1)).squeeze(-1)
-            self.lifter = TorchPC3(mlp, dynamics_fn, self.obs_dim, self.control_dim, self.state_dim, sigma=sigma, determinstic_encoder=determinstic_encoder)
-            self.sysid_opt = torch.optim.SGD([self.A, self.B], lr=sysid_lr, weight_decay=1e-5)
-            self.lifter_opt = torch.optim.SGD(self.lifter.parameters(), lr=lifter_lr, weight_decay=1e-5)
+            if LOSS_WEIGHTS['reconstruction'] > 0:
+                layer_dims.reverse()
+                dec = TorchMLP(layer_dims,
+                            activation=torch.nn.ReLU,
+                            #   normalization=torch.nn.LayerNorm,
+                            drop_last_activation=True,
+                            use_bias=True,
+                            seed=seed)
+            else:
+                dec = None
+            self.lifter = TorchPC3(enc, self.obs_dim, self.control_dim, self.state_dim, 
+                                   AB_method=AB_method, decoder=dec, sigma=sigma, determinstic_encoder=determinstic_encoder, 
+                                   do_cpc=LOSS_WEIGHTS['cpc'] > 0, do_jac=LOSS_WEIGHTS['jac'] > 0).float()
+            self.lifter_opt = torch.optim.Adam(self.lifter.parameters(), lr=lifter_lr)
 
         else: raise NotImplementedError(method)
         
         self.trained = False
         pass
     
+    def dynamics(self, z, u): return (self.A @ z.unsqueeze(-1) + self.B @ u.unsqueeze(-1)).squeeze(-1)
+    
     def end_exploration(self, wordy: bool=True):
         logging.info('({}): ending sysid phase at step {}'.format(get_classname(self), self.t))        
         states, controls, costs = self.concatenate_trajectories()
         assert states.shape[0] == controls.shape[0] and states.shape[0] == costs.shape[0]
         
+        # find the index of the last datapoint in each trajectory. we will ignore loss terms referencing x_t and x_{t+1} for all t in ignore_idxs,
+        # since a reset happened between those two points
+        traj_lens = [len(traj) for traj in self.trajs]
+        ignore_idxs = np.cumsum(traj_lens) - 1  # -1 to capture last idxs of old trajs, not first idxs of new trajs
+        mask = np.ones(states.shape[0], dtype=bool)
+        mask[ignore_idxs] = False
+        mask = mask[:-1]
+        
         if self.method == 'identity':
-            self.A, self.B = least_squares(states, controls, max_opnorm=MAX_OPNORM)
+            self.A, self.B = least_squares(states, controls, mask=mask, max_opnorm=MAX_OPNORM)
         
         elif self.method in KOOPMAN_METHODS:
             self.model.fit(x=np.array(states), u=np.array(controls))
             self.A = jnp.array(self.model.A.reshape(self.state_dim, self.state_dim))
             self.B = jnp.array(self.model.B.reshape(self.state_dim, self.control_dim))
             
-        elif self.method == 'nn':            
+        elif self.method == 'nn':  
+            for k in LOSS_WEIGHTS.keys(): self.stats.register(k, obj_class=float)
+                      
             # ----------------------------
             # DATASET
             # ----------------------------
-            x, u, f = map(lambda arr: torch.tensor(np.array(arr)), [states, controls, costs])
-            dl = data.DataLoader(data.TensorDataset(x[:-1], u[:-1], x[1:], f[1:]), batch_size=self.batch_size, shuffle=True, drop_last=True)
             
-            for k in LOSS_WEIGHTS.keys(): self.stats.register(k, obj_class=float)
+            x, u, f = map(lambda arr: torch.tensor(np.array(arr)), [states, controls, costs])  # convert to tensors
+            
+            # normalize observations to be centered with unit variance. DONT TOUCH CONTROLS
+            mean, std = torch.mean(x, dim=0), torch.std(x, dim=0)
+            self.normalize = lambda t: (t - mean) / std
+            x = self.normalize(x)
+            
+            # normalize costs to be in [0, 1], assuming they were nonnegative to begin with. DONT TOUCH CONTROLS
+            fmin, fmax = torch.min(f), torch.max(f)
+            # def unnormalize(t):
+            #     gt_cost = (torch.linalg.norm(t, dim=-1) ** 2 * (fmax - fmin) + fmin).unsqueeze(-1)
+            #     t = t * torch.sqrt(gt_cost) / torch.linalg.norm(t, dim=-1).unsqueeze(-1)
+            #     assert torch.allclose(torch.linalg.norm(t, dim=-1) ** 2, gt_cost.squeeze(-1))
+            #     return t
+            self.unnormalize = lambda t: t * torch.sqrt(fmax)
+            f = f / fmax
+            
+            mask = torch.tensor(np.array(mask))
             
             # sysid + train loop
-            print_every = 25
+            print_every = max(self.num_epochs // 10, 1)
             logging.info('training!')
-            losses = defaultdict(list)
-            i_iter = 0
+            overall_losses = defaultdict(list)
+
             for i_epoch in range(self.num_epochs):
-                epoch_losses = defaultdict(float)
-                for batch in dl:  # train lifter
-                    self.sysid_opt.zero_grad()
-                    self.lifter_opt.zero_grad()
-                    
-                    x_prev, u_prev, x, f = batch
-                    (z_prev, z, zhat), batch_losses = self.lifter.get_embs_and_losses(x_prev, u_prev, x)  # this references self.A and self.B, and so we backprop to them!
-                    
-                    # do a lil sysid and make sure it looks right (note that this backprops through to the lifter as well!)
-                    # NOTE perhaps we should do that globally, once an epoch, instead of every batch?
-                    if LOSS_WEIGHTS['consistency'] > 0:
-                        ret = torch.linalg.lstsq(torch.hstack((z_prev, u_prev)), z, rcond=-1).solution
-                        A, B = ret[:self.state_dim].T, ret[self.state_dim:].T
-                        _k = 'consistency'; batch_losses[_k] = torch.linalg.norm(A - self.A) + torch.linalg.norm(B - self.B)
-                    else: _k = 'consistency'; batch_losses[_k] = torch.zeros(1)[0]
-                    _k = 'simplification'; batch_losses[_k] = torch.abs(torch.linalg.norm(z, dim=-1) ** 2 - f).mean()
-                    _k = 'residual centeredness'; batch_losses[_k] = ((z - zhat).mean(dim=0) ** 2).sum() # coordinatewise squared mean residual
-                    _k = 'centeredness'; batch_losses[_k] = (z.mean(dim=0) ** 2).sum()
-                    
-                    loss = 0.
-                    for k, v in batch_losses.items(): loss += LOSS_WEIGHTS[k] * v
-                    loss.backward()
-                    self.sysid_opt.step()
-                    self.lifter_opt.step()
-                    
-                    for k, v in batch_losses.items(): 
-                        v = v.item()
-                        epoch_losses[k] += v / len(dl)
-                        self.stats.update(k, value=v, t=i_iter)
-                    i_iter += 1
-                for k, v in epoch_losses.items(): losses[k].append(v)
+                
+                self.lifter_opt.zero_grad()
+                
+                (z, zhat), (A, B), losses = self.lifter.get_embs_and_losses(x, u, mask)   
+                zprev, zgt = z[:-1], z[1:]             
+                
+                # linearization error
+                disturbances = (zgt - zhat)[mask]
+                if LOSS_WEIGHTS['l2 linearization'] > 0: losses['l2 linearization'] = torch.nn.functional.mse_loss(disturbances, torch.zeros_like(disturbances))
+                if LOSS_WEIGHTS['l1 linearization'] > 0: losses['l1 linearization'] = torch.nn.functional.l1_loss(disturbances, torch.zeros_like(disturbances))
+                
+                # how well we can reproduce the controls we used --   znext = A @ z + B @ u  ->  B^-1 @ (znext - A @ z) = u
+                if LOSS_WEIGHTS['guess the control'] > 0: 
+                    uhat = (torch.linalg.pinv(B) @ (zgt.unsqueeze(-1) - (A @ zprev.unsqueeze(-1)))).squeeze(-1) 
+                    losses['guess the control'] = torch.nn.functional.mse_loss(uhat[mask], u[:-1][mask])
+                
+                # how well the squared norm represents cost
+                if LOSS_WEIGHTS['simplification'] > 0: losses['simplification'] = torch.nn.functional.mse_loss(torch.linalg.norm(z, dim=-1) ** 2, f)
+                
+                # centeredness
+                if LOSS_WEIGHTS['residual centeredness'] > 0: losses['residual centeredness'] = torch.linalg.norm(disturbances.mean(dim=0)) ** 2  # sq norm of mean residual
+                if LOSS_WEIGHTS['centeredness'] > 0: losses['centeredness'] = torch.linalg.norm(z.mean(dim=0)) ** 2  # sq norm of mean embedding
+                
+                loss = 0.
+                for k, v in losses.items(): 
+                    l = LOSS_WEIGHTS[k] * v
+                    loss += l
+                    overall_losses[k].append(l.item())
+                loss.backward()
+                self.lifter_opt.step()
+                
                 if i_epoch % print_every == 0 or i_epoch == self.num_epochs - 1:
-                    logging.info('mean loss for epochs {} - {} was {}'.format(i_epoch - print_every, i_epoch, {k: np.mean(v[-print_every:]) for k, v in losses.items()}))
+                    logging.info('mean loss for epochs {} - {}:'.format(i_epoch - print_every, i_epoch))
+                    for k, v in overall_losses.items(): logging.info('\t\t{}: {}'.format(k, np.mean(v[-print_every:])))
                 
             with torch.no_grad():
-                z = jnp.array(self.lifter.encode(torch.tensor(np.array(states))).detach().data.numpy())
+                z = jnp.array(self.unnormalize(self.lifter.encode(self.normalize(torch.tensor(np.array(states))))).detach().data.numpy())
                 self.A, self.B = least_squares(z, controls, max_opnorm=MAX_OPNORM)
+        
+        if hasattr(self.lifter, 'A'):
+            self.lifter.A.detach_(); self.lifter.B.detach_()
+            self.lifter.B *= fmax ** 0.5
+            print(fmax)
             
         if wordy: print(summarize_lds(self.A, self.B))
         self.trained = True
@@ -266,9 +311,11 @@ class Lifter(SystemModel):
             state = jnp.array(state)
         elif self.method == 'nn':  # we do dl in torch, not jax
             with torch.no_grad():
-                x = torch.tensor(np.array(obs.reshape(1, -1)))
-                z = self.lifter.encode(x).squeeze(0).data.numpy()
-                state = jnp.array(z)
+                x = torch.tensor(np.array(obs.reshape(1, -1)), dtype=torch.float32)
+                x = self.normalize(x)
+                z = self.lifter.encode(x)
+                z = self.unnormalize(z)
+                state = jnp.array(z.squeeze(0).data.numpy())
         return state
     
 # ---------------------------------------------------------------------------------------------------------------------
@@ -290,7 +337,7 @@ class LiftedController(Controller):
         self.state_dim = lifter.obs_dim
         self.stats = Stats.concatenate((controller.stats, lifter.stats))
         controller.stats = self.stats
-        lifter.stats = self.stats
+        # lifter.stats = self.stats
         self.system_reset_hook = self.controller.system_reset_hook
         pass
     

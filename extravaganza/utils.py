@@ -144,29 +144,44 @@ def dare_gain(A, B, Q = None, R = None):
         K = jnp.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)  # compute LQR gain
     return K
 
-# def method_of_moments(xs: jnp.ndarray, 
-#                       us: jnp.ndarray):
-#     """
-#     runs method of moments to find A, B s.t.
-#         `A @ x_{t} + B @ u_{t} = x_{t+1}`
-#     """
-#     k = int(0.15 * self.t)
+def method_of_moments(xs: jnp.ndarray, 
+                      us: jnp.ndarray,
+                      mask: jnp.ndarray = None):
+    """
+    runs method of moments to find A, B s.t.
+        `A @ x_{t} + B @ u_{t} = x_{t+1}`
+    """
+    k = int(0.15 * len(xs))
+    scan_len = len(xs) - k - 1 # need extra -1 because we iterate over j = 0, ..., k
+    
+    if isinstance(xs, torch.Tensor):
+        # prepare vectors and retrieve B
+        N_j = torch.stack([xs[j: j + scan_len].T @ us[:scan_len] for j in range(k + 1)], dim=0) / scan_len
+        B = N_j[0]
+        
+        # retrieve A
+        C_0, C_1 = N_j[:-1], N_j[1:]
+        C_inv = torch.linalg.inv(torch.tensordot(C_0, C_0, dims=((0, 2), (0, 2))) + 1e-3 * torch.eye(xs.shape[1]))
+        A = torch.tensordot(C_1, C_0, dims=((0, 2), (0, 2))) @ C_inv
+        return A, B
+        
+    elif isinstance(xs, np.ndarray):
+        xs, us = jnp.array(xs), jnp.array(us)
+        
+    # prepare vectors and retrieve B
+    N_j = jnp.array([jnp.dot(xs[j: j + scan_len].T, us[:scan_len]) for j in range(k + 1)]) / scan_len
+    B = N_j[0] # jnp.dot(states[1:].T, eps[:-1]) / (self.t - 1)
 
-#     states = jnp.array(self.state_history)
-#     eps = jnp.array(self.eps_history)
-
-#     # prepare vectors and retrieve B
-#     scan_len = self.t - k - 1 # need extra -1 because we iterate over j = 0, ..., k
-#     N_j = jnp.array([jnp.dot(states[j: j + scan_len].T, eps[:scan_len]) for j in range(k + 1)]) / scan_len
-#     B = N_j[0] # jnp.dot(states[1:].T, eps[:-1]) / (self.t - 1)
-
-#     # retrieve A
-#     C_0, C_1 = N_j[:-1], N_j[1:]
-#     C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-3 * np.identity(self.state_dim))
-#     A = jnp.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
+    # retrieve A
+    C_0, C_1 = N_j[:-1], N_j[1:]
+    C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-3 * jnp.identity(xs.shape[1]))
+    A = jnp.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
+    
+    return A, B
     
 def least_squares(xs: jnp.ndarray, 
                   us: jnp.ndarray, 
+                  mask: jnp.ndarray = None,
                   max_opnorm: float = None):
     """
     runs least squares to find A, B s.t.
@@ -180,20 +195,22 @@ def least_squares(xs: jnp.ndarray,
     x_out = xs[1:]
     u_in = us[:-1]
     
+    if mask is None:
+        if isinstance(xs, torch.Tensor): mask = torch.ones(xs.shape[0] - 1, dtype=bool)
+        elif isinstance(xs, (np.ndarray, jnp.ndarray)): mask = np.ones(xs.shape[0] - 1, dtype=bool) 
+        else: raise NotImplementedError(xs.__class__)
+         
     if isinstance(xs, torch.Tensor):
         assert isinstance(us, torch.Tensor), us.__class__
-        ret = torch.linalg.lstsq(torch.hstack((x_in, u_in)), x_out, rcond=-1).solution
+        ret = torch.linalg.lstsq(torch.hstack((x_in, u_in))[mask], x_out[mask], rcond=-1).solution
         A, B = ret[:ds].T, ret[ds:].T
         return A, B
     
-    if isinstance(xs, jnp.ndarray): xs = np.array(xs)
-    if isinstance(us, jnp.ndarray): us = np.array(us)
-    
     if max_opnorm is None:
-        A_B = np.linalg.lstsq(np.hstack((x_in, u_in)), x_out, rcond=-1)[0]
+        A_B = np.linalg.lstsq(np.hstack((x_in, u_in))[mask], x_out[mask], rcond=-1)[0]
         A, B = A_B[:ds].T, A_B[ds:].T
     else:
-        logging.info('(UTILS) constraining operator norm of `A` to be <= {}'.format(max_opnorm))
+        # logging.info('(UTILS) constraining operator norm of `A` to be <= {}'.format(max_opnorm))
         A_B_shape = (ds, ds + du)
         def A_opnorm(t):
             A = t.reshape(*A_B_shape)[:, :ds]  # only grab A
@@ -264,8 +281,9 @@ def sample(jkey: jax.random.KeyArray,
     if sampling_method == 'ball':
         v = jax.random.ball(jkey, np.prod(shape), dtype=jnp.float32).reshape(*shape)
     elif sampling_method == 'sphere':
+        assert len(shape) <= 2, 'expected either 1D vector or 2D with a batch dim'
         v = jax.random.normal(jkey, shape, dtype=jnp.float32)
-        v = v / jnp.linalg.norm(v)
+        v = v / jnp.linalg.norm(v, axis=-1).reshape(*shape[:-1], 1)
     elif sampling_method == 'rademacher':
         v = jax.random.rademacher(jkey, shape, dtype=jnp.float32)
     elif sampling_method == 'normal':

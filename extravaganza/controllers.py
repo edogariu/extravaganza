@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from extravaganza.stats import Stats
 from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname, dare_gain
 
-BETA = 1e1  # norm clipping for both the controller matrices and their grads
+BETA = 1e2  # norm clipping for both the controller matrices and their grads
 
 def clip(x: jnp.ndarray, name: str = None, beta: float = BETA):
     norm = jnp.linalg.norm(x)  
@@ -92,6 +92,7 @@ class EvanBPC(Controller):
         self.bounds = bounds
         self.decay_scales = decay_scales
         self.initial_control = initial_u
+        self.just_reset = False
 
         # for rescaling controls
         self.rescale_u = lambda u: rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else u
@@ -167,6 +168,10 @@ class EvanBPC(Controller):
 
 # ------------------------------------------------------------------------------------------------------------
     
+    def system_reset_hook(self):
+        self.just_reset = True
+        return super().system_reset_hook()
+    
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         assert state.shape == (self.state_dim,)
         
@@ -209,6 +214,9 @@ class EvanBPC(Controller):
         assert control.shape == (self.control_dim,)
                 
         self.t += 1
+        if self.just_reset:  # don't update controller on resets
+            self.just_reset = False
+            return
         
         # 1. observe state and disturbance
         disturbance = next_state - (self.A @ state + self.B @ control)
@@ -232,7 +240,7 @@ class EvanBPC(Controller):
             
         # 4. ensure norms are good
         self.M = clip(self.M, 'M')
-        self.K = clip(self.K, 'K')
+        # self.K = clip(self.K, 'K')
         self.M0 = clip(self.M0, 'M0')
             
         self.stats.update('disturbances', disturbance, t=self.t)

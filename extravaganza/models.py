@@ -1,6 +1,7 @@
-from typing import List, Iterable, Callable
+import logging
+from typing import List, Iterable
 
-from extravaganza.utils import set_seed, jkey
+from extravaganza.utils import set_seed, jkey, least_squares, method_of_moments
 
 #  ============================================================================================
 #  ============================================================================================
@@ -193,29 +194,83 @@ class TorchAutoencoder(nn.Module):
 class TorchPC3(nn.Module):
     def __init__(self, 
                  encoder: TorchMLP,
-                 dynamics_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],  # deterministic dynamics F(x_t, u_t)
                  x_dim: int,
                  u_dim: int,
                  z_dim: int,
+                 AB_method: str = 'learned',
                  sigma: float = 0,
-                 determinstic_encoder: bool = False):
+                 determinstic_encoder: bool = False,
+                 decoder: TorchMLP = None, 
+                 do_cpc: bool = False,
+                 do_jac: bool = False):
         super().__init__()
 
         self.encoder = encoder
+        self.decoder = decoder
         assert encoder.input_dim == x_dim, 'inconsistent dims'
-        self.dynamics_fn = dynamics_fn
+        if decoder is not None: 
+            assert encoder.output_dim == decoder.input_dim and decoder.output_dim == x_dim, 'inconsistent dims'
+            logging.info('(PC3): decoder provided, so reconstruction error WILL be computed')
+        else:
+            logging.info('(PC3): decoder not provided, so reconstruction error will NOT be computed')
         
         self.obs_dim, self.state_dim, self.control_dim = x_dim, z_dim, u_dim
         self.sigma = sigma
         
+        self.do_cpc = do_cpc
+        if self.do_cpc: 
+            """
+            Contrastive predictive coding, see https://arxiv.org/pdf/1807.03748.pdf.
+            """
+            self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired' means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
+            # self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=False)
+            logging.info('(PC3): contrastive predictive coding WILL be computed')
+        else: 
+            logging.info('(PC3): contrastive predictive coding will NOT be computed')
+            
+        self.do_jac = do_jac
+        if self.do_jac: logging.info('(PC3): jacobian loss WILL be computed')
+        else: logging.info('(PC3): jacobian loss will NOT be computed')
+        
         self.mu = nn.Linear(self.encoder.output_dim, z_dim)
         self.logvar = nn.Linear(self.encoder.output_dim, z_dim) if not determinstic_encoder else None
         
-        """
-        Contrastive predictive coding, see https://arxiv.org/pdf/1807.03748.pdf.
-        """
-        self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
-        # self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=True)
+        if self.decoder is not None:
+            # train the decoder to match the encoder in the beginning
+            num_iters, batch_size = 5000, 256
+            decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=0.002)
+            losses = []
+            for _ in range(num_iters):
+                decoder_opt.zero_grad()
+                x = torch.randn((batch_size, x_dim))
+                z = self.encode(x)
+                loss = torch.nn.functional.mse_loss(self.decoder(z), x)
+                loss.backward()
+                decoder_opt.step()
+                losses.append(loss.item())
+            import matplotlib.pyplot as plt
+            plt.plot(range(len(losses)), losses)
+            plt.show()
+            
+        assert AB_method in ['learned', 'regression_nograd', 'regression', 'moments_nograd', 'moments']
+        logging.info('(PC3): using "{}" method to get the AB matrices during each training step'.format(AB_method))
+        if AB_method == 'learned':
+            # self.A = torch.nn.Parameter(torch.ones(z_dim, dtype=torch.float32, requires_grad=True))
+            self.A = torch.nn.Parameter(torch.eye(z_dim, dtype=torch.float32, requires_grad=True))
+            self.B = torch.nn.Parameter(torch.randn((z_dim, u_dim), dtype=torch.float32, requires_grad=True))
+            # self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
+            self.get_AB = lambda xs, us, mask: (self.A, self.B)
+        elif AB_method == 'regression_nograd':
+            def get_AB(xs, us, mask):
+                with torch.no_grad(): return least_squares(xs, us, mask=mask)
+            self.get_AB = get_AB
+        elif AB_method == 'regression': self.get_AB = least_squares
+        elif AB_method == 'moments_nograd':
+            def get_AB(xs, us, mask):
+                with torch.no_grad(): return method_of_moments(xs, us, mask=mask)
+            self.get_AB = get_AB
+        elif AB_method == 'moments': self.get_AB = method_of_moments
+        else: raise NotImplementedError(AB_method)
         pass
         
     def encode(self, x: torch.Tensor): 
@@ -231,21 +286,38 @@ class TorchPC3(nn.Module):
         if unbatch: enc = enc.squeeze(0)
         return enc
     
-    
-    def get_embs_and_losses(self, obs, control, next_obs): 
-        assert control.ndim == 2 and control.shape[1] == self.control_dim, (control.shape, self.control_dim)
-
-        zprev, z = self.encode(obs), self.encode(next_obs)
-        zhat = self.dynamics_fn(zprev, control)
+    def get_embs_and_losses(self, obs, controls, mask = None): 
+        """
+        use `prev_mask` for loss terms indexed on the x_t side.
+        use `next_mask` for loss terms indexed on the x_{t+1} side.
+        """
+        assert controls.ndim == 2 and controls.shape[1] == self.control_dim, (controls.shape, self.control_dim)
+        assert obs.shape[0] == controls.shape[0], (obs.shape[0], controls.shape[0])
         
-        # perturb the next state encoding, see Section 4.2 of PC3 paper
-        if self.sigma > 0: z = z + self.sigma * torch.randn_like(z)
+        if mask is not None: assert mask.shape == (obs.shape[0] - 1,), (mask.shape, obs.shape[0] - 1)
+        else: mask = torch.ones(obs.shape[0] - 1, dtype=bool)
+
+        z = self.encode(obs)
+        zprev = z[:-1]
+        zgt = z[1:]
+        
+        # estimate linear predicted embeddings
+        A, B = self.get_AB(z, controls, mask)
+        zhat = (A @ zprev.unsqueeze(-1) + B @ controls[:-1].unsqueeze(-1)).squeeze(-1)
+        
+        # perturb the g.t. next state encoding, see Section 4.2 of PC3 paper
+        if self.sigma > 0: zgt = zgt + self.sigma * torch.randn_like(zgt)
         
         losses = {}
-        losses['linearization'] = ((zhat - z) ** 2).sum(dim=-1).mean(dim=0)  # MSE of linear latent next state prediction
-        losses['cpc'] = self.cpc_loss(z, zhat, zprev)  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
-        # losses['cpc'] = self.cpc_loss(z, zhat)
-        return (zprev, z, zhat), losses
+        if self.do_cpc: losses['cpc'] = self.cpc_loss(zhat[mask], zgt[mask], None)  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
+        if self.decoder is not None: losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(z), obs)
+        if self.do_jac:
+            jacs = torch.func.vmap(torch.func.jacrev(self.encode))(obs[:-1])
+            LHS = (jacs @ (obs[1:] - obs[:-1]).unsqueeze(-1)).squeeze(-1)
+            RHS = (A @ zprev.unsqueeze(-1) + B @ controls[:-1].unsqueeze(-1)).squeeze(-1) - zprev
+            losses['jac'] = torch.nn.functional.mse_loss(LHS[mask], RHS[mask])
+        
+        return (z, zhat), (A, B), losses
     
 
 if __name__ == '__main__':
@@ -263,3 +335,4 @@ if __name__ == '__main__':
     TorchMLP = TorchMLP(layer_dims=[int(28 * 28), 100, 100, 100, 100, 10]).float()
     TorchCNN = TorchCNN(input_shape=(28, 28), output_dim=10)
     print(count_parameters(TorchMLP), count_parameters(TorchCNN))
+

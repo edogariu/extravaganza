@@ -36,6 +36,10 @@ class Trajectory:
     
     def add_control(self, control: jnp.ndarray):
         self.u.append(control)
+        
+    def __len__(self):
+        assert len(self.x) == len(self.u) and len(self.u) == len(self.f), (len(self.x), len(self.u), len(self.f))
+        return len(self.x)
 
 class Observable:
     

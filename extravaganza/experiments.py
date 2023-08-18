@@ -99,6 +99,7 @@ class Experiment:
             system = make_system()
             if not system.OBSERVABLE: assert isinstance(observable, TimeDelayedObservation), observable.__class__
             controller = make_controller(system)
+            system.reset_hook = controller.system_reset_hook
             
             # handle stats
             stats = Stats()
@@ -157,7 +158,6 @@ class Experiment:
                 if t == 0 or reset_condition(t):
                     logging.info('(EXPERIMENT): reset at t={}!'.format(t))
                     system.reset(reset_seed)
-                    controller.system_reset_hook()
                     traj = Trajectory()
                     # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
                     pass
