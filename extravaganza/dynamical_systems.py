@@ -307,7 +307,6 @@ class LDS(DynamicalSystem):
         self.control_dim = control_dim
         A, B = random_lds(state_dim=self.state_dim, control_dim=self.control_dim)  # random discrete, stable system
         self.A, self.B = jnp.array(A).reshape(state_dim, state_dim), jnp.array(B).reshape(state_dim, control_dim)
-        assert self.A.shape == (state_dim, state_dim) and self.B.shape == (state_dim, control_dim)
         
         # figure out disturbances
         disturbance_fns = {'none': lambda t: 0.,
@@ -321,7 +320,7 @@ class LDS(DynamicalSystem):
         self.disturbance = disturbance_fns[disturbance_type]
         
         # figure out costs
-        cost_fns = {'quad': lambda x: jnp.dot(x, x),
+        cost_fns = {'quad': lambda x: jnp.linalg.norm(x) ** 2,
                     'hinge': lambda x: jnp.sum(jnp.abs(x))}
         if isinstance(cost_fn, str): 
             assert cost_fn in cost_fns

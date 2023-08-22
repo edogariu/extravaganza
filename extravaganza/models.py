@@ -199,7 +199,7 @@ class TorchPC3(nn.Module):
                  z_dim: int,
                  AB_method: str = 'learned',
                  sigma: float = 0,
-                 determinstic_encoder: bool = False,
+                 deterministic_encoder: bool = False,
                  decoder: TorchMLP = None, 
                  do_cpc: bool = False,
                  do_jac: bool = False):
@@ -211,8 +211,6 @@ class TorchPC3(nn.Module):
         if decoder is not None: 
             assert encoder.output_dim == decoder.input_dim and decoder.output_dim == x_dim, 'inconsistent dims'
             logging.info('(PC3): decoder provided, so reconstruction error WILL be computed')
-        else:
-            logging.info('(PC3): decoder not provided, so reconstruction error will NOT be computed')
         
         self.obs_dim, self.state_dim, self.control_dim = x_dim, z_dim, u_dim
         self.sigma = sigma
@@ -224,27 +222,25 @@ class TorchPC3(nn.Module):
             """
             self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired' means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
             # self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=False)
-            logging.info('(PC3): contrastive predictive coding WILL be computed')
-        else: 
-            logging.info('(PC3): contrastive predictive coding will NOT be computed')
             
         self.do_jac = do_jac
-        if self.do_jac: logging.info('(PC3): jacobian loss WILL be computed')
-        else: logging.info('(PC3): jacobian loss will NOT be computed')
+        if self.do_jac:
+            self.jac_func = torch.func.vmap(torch.func.jacfwd(self.encode_aux, argnums=0, has_aux=True))
         
         self.mu = nn.Linear(self.encoder.output_dim, z_dim)
-        self.logvar = nn.Linear(self.encoder.output_dim, z_dim) if not determinstic_encoder else None
+        self.logvar = nn.Linear(self.encoder.output_dim, z_dim) if not deterministic_encoder else None
         
         if self.decoder is not None:
             # train the decoder to match the encoder in the beginning
-            num_iters, batch_size = 5000, 256
-            decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=0.002)
+            num_iters, batch_size = 5000, 64
+            decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=0.001)
             losses = []
             for _ in range(num_iters):
                 decoder_opt.zero_grad()
                 x = torch.randn((batch_size, x_dim))
-                z = self.encode(x)
-                loss = torch.nn.functional.mse_loss(self.decoder(z), x)
+                f = torch.rand((batch_size,)) * 2
+                _, z_latent = self.encode(x, sq_norms=f)
+                loss = torch.nn.functional.mse_loss(self.decoder(z_latent), x)
                 loss.backward()
                 decoder_opt.step()
                 losses.append(loss.item())
@@ -255,11 +251,11 @@ class TorchPC3(nn.Module):
         assert AB_method in ['learned', 'regression_nograd', 'regression', 'moments_nograd', 'moments']
         logging.info('(PC3): using "{}" method to get the AB matrices during each training step'.format(AB_method))
         if AB_method == 'learned':
-            # self.A = torch.nn.Parameter(torch.ones(z_dim, dtype=torch.float32, requires_grad=True))
-            self.A = torch.nn.Parameter(torch.eye(z_dim, dtype=torch.float32, requires_grad=True))
+            self.A = torch.nn.Parameter(torch.ones(z_dim, dtype=torch.float32, requires_grad=True))
+            # self.A = torch.nn.Parameter(torch.eye(z_dim, dtype=torch.float32, requires_grad=True))
             self.B = torch.nn.Parameter(torch.randn((z_dim, u_dim), dtype=torch.float32, requires_grad=True))
-            # self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
-            self.get_AB = lambda xs, us, mask: (self.A, self.B)
+            self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
+            # self.get_AB = lambda xs, us, mask: (self.A, self.B)
         elif AB_method == 'regression_nograd':
             def get_AB(xs, us, mask):
                 with torch.no_grad(): return least_squares(xs, us, mask=mask)
@@ -273,20 +269,34 @@ class TorchPC3(nn.Module):
         else: raise NotImplementedError(AB_method)
         pass
         
-    def encode(self, x: torch.Tensor): 
+    def encode(self, x: torch.Tensor, sq_norms: torch.Tensor = None): 
         unbatch = x.ndim == 1
+        if sq_norms is not None:
+            if not isinstance(sq_norms, torch.Tensor): sq_norms = torch.tensor(sq_norms)
+            if not unbatch:
+                assert sq_norms.shape == (x.shape[0],)
+                assert all(sq_norms >= 0.)
+        
         if unbatch: x = x.unsqueeze(0)
         assert x.shape[1] == self.obs_dim, (x.shape, self.obs_dim)
-        z = self.encoder(x)
-        enc = self.mu(z)
+        z_latent = self.encoder(x)
+        enc = self.mu(z_latent)
         if self.logvar is not None:  # actually sample from trained distribution
-            logvar = self.logvar(z)
+            logvar = self.logvar(z_latent)
             enc = enc + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
         assert enc.shape[1] == self.state_dim, (enc.shape, self.state_dim)
+        if sq_norms is not None:
+            enc = enc / torch.norm(enc, dim=-1).unsqueeze(-1)
+            enc = enc * torch.sqrt(sq_norms).unsqueeze(-1)
         if unbatch: enc = enc.squeeze(0)
-        return enc
+            
+        return enc, z_latent
     
-    def get_embs_and_losses(self, obs, controls, mask = None): 
+    def encode_aux(self, x: torch.Tensor, sq_norms: torch.Tensor = None): 
+        enc, z = self.encode(x, sq_norms=sq_norms)
+        return enc, (enc, z)
+    
+    def get_embs_and_losses(self, obs, controls, sq_norms = None, mask = None): 
         """
         use `prev_mask` for loss terms indexed on the x_t side.
         use `next_mask` for loss terms indexed on the x_{t+1} side.
@@ -294,10 +304,15 @@ class TorchPC3(nn.Module):
         assert controls.ndim == 2 and controls.shape[1] == self.control_dim, (controls.shape, self.control_dim)
         assert obs.shape[0] == controls.shape[0], (obs.shape[0], controls.shape[0])
         
+        # prep mask
         if mask is not None: assert mask.shape == (obs.shape[0] - 1,), (mask.shape, obs.shape[0] - 1)
         else: mask = torch.ones(obs.shape[0] - 1, dtype=bool)
 
-        z = self.encode(obs)
+        # get our embeddings
+        if self.do_jac: 
+            args = (obs, sq_norms) if sq_norms is not None else (obs,)  # pytorch doesnt like passing None into vmap's fns
+            jacs, (z, z_latent) = self.jac_func(*args)  # uses auxiliary for value so we don't compute twice
+        else: z, z_latent = self.encode(obs, sq_norms)
         zprev = z[:-1]
         zgt = z[1:]
         
@@ -309,13 +324,13 @@ class TorchPC3(nn.Module):
         if self.sigma > 0: zgt = zgt + self.sigma * torch.randn_like(zgt)
         
         losses = {}
-        if self.do_cpc: losses['cpc'] = self.cpc_loss(zhat[mask], zgt[mask], None)  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
-        if self.decoder is not None: losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(z), obs)
-        if self.do_jac:
-            jacs = torch.func.vmap(torch.func.jacrev(self.encode))(obs[:-1])
-            LHS = (jacs @ (obs[1:] - obs[:-1]).unsqueeze(-1)).squeeze(-1)
+        if self.do_cpc: losses['cpc'] = self.cpc_loss(zhat[mask], zgt[mask], zprev[mask])  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
+        if self.decoder is not None: losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(z_latent), obs)
+        if self.do_jac: 
+            LHS = (jacs[:-1] @ (obs[1:] - obs[:-1]).unsqueeze(-1)).squeeze(-1)
             RHS = (A @ zprev.unsqueeze(-1) + B @ controls[:-1].unsqueeze(-1)).squeeze(-1) - zprev
             losses['jac'] = torch.nn.functional.mse_loss(LHS[mask], RHS[mask])
+        if sq_norms is not None: assert torch.allclose(torch.norm(z, dim=-1) ** 2, sq_norms), (torch.norm(z, dim=-1) ** 2, sq_norms)
         
         return (z, zhat), (A, B), losses
     

@@ -159,7 +159,6 @@ class Experiment:
                     logging.info('(EXPERIMENT): reset at t={}!'.format(t))
                     system.reset(reset_seed)
                     traj = Trajectory()
-                    # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
                     pass
                     
                 next_cost, next_state = system.interact(control)  # state will be `None` for unobservable systems

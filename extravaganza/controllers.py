@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from extravaganza.stats import Stats
 from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname, dare_gain
 
-BETA = 1e2  # norm clipping for both the controller matrices and their grads
+BETA = 1e6  # norm clipping for both the controller matrices and their grads
 
 def clip(x: jnp.ndarray, name: str = None, beta: float = BETA):
     norm = jnp.linalg.norm(x)  
@@ -92,7 +92,7 @@ class EvanBPC(Controller):
         self.bounds = bounds
         self.decay_scales = decay_scales
         self.initial_control = initial_u
-        self.just_reset = False
+        self.reset_t = -1
 
         # for rescaling controls
         self.rescale_u = lambda u: rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else u
@@ -143,7 +143,7 @@ class EvanBPC(Controller):
             def grad_K(diff) -> jnp.ndarray:
                 # val = self.eps[-1].reshape(self.control_dim, 1) @ self.prev_state.reshape(1, self.state_dim)
                 val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.state_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)]).sum(axis=0)
-                return diff * val #* self.control_dim * self.state_dim * self.h
+                return -diff * val #* self.control_dim * self.state_dim * self.h
             
         self.grads = deque([(jnp.zeros_like(self.M), jnp.zeros_like(self.M0), jnp.zeros_like(self.K))], maxlen=self.h)
         self.grad_M = grad_M
@@ -169,7 +169,7 @@ class EvanBPC(Controller):
 # ------------------------------------------------------------------------------------------------------------
     
     def system_reset_hook(self):
-        self.just_reset = True
+        self.reset_t = self.t
         return super().system_reset_hook()
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
@@ -179,9 +179,9 @@ class EvanBPC(Controller):
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
 
         if self.method == 'FKM':  # perturb em all
-            eps_M = sample(jkey(), (self.h, self.control_dim, self.state_dim))
-            eps_M0 = sample(jkey(), (self.control_dim,))
-            eps_K = sample(jkey(), (self.control_dim, self.state_dim))
+            eps_M = sample(jkey(), (self.h, self.control_dim, self.state_dim), 'normal')
+            eps_M0 = sample(jkey(), (self.control_dim,), 'normal')
+            eps_K = sample(jkey(), (self.control_dim, self.state_dim), 'normal')
             M_tilde = M_tilde + M_scale * eps_M
             M0_tilde = M0_tilde + M0_scale * eps_M0
             K_tilde = K_tilde + K_scale * eps_K
@@ -190,7 +190,7 @@ class EvanBPC(Controller):
             if K_scale > 0: self.eps_K = append(self.eps_K, eps_K)
             
         elif self.method == 'REINFORCE':  # perturb output only
-            eps = sample(jkey(), (self.control_dim,))
+            eps = sample(jkey(), (self.control_dim,), 'normal')
             M0_tilde = M0_tilde + M0_scale * eps
             if M0_scale > 0: self.eps = append(self.eps, eps)
             
@@ -214,14 +214,15 @@ class EvanBPC(Controller):
         assert control.shape == (self.control_dim,)
                 
         self.t += 1
-        if self.just_reset:  # don't update controller on resets
-            self.just_reset = False
-            return
         
         # 1. observe state and disturbance
-        disturbance = next_state - (self.A @ state + self.B @ control)
+        disturbance = next_state - (self.A @ state + self.B @ control) if self.reset_t == -1 else jnp.zeros(self.state_dim)
         self.state_history = append(self.state_history, next_state)
-        self.disturbance_history = append(self.disturbance_history, disturbance)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+        self.disturbance_history = append(self.disturbance_history, disturbance)
+        
+        if self.reset_t > 0: 
+            if self.t - self.reset_t <= self.h + 1: return  # don't update controller for `h` steps after resets
+            else: self.reset_t = -1 
         
         # 2. compute change in cost for zero order optimization
         cost_diff = next_cost - cost
@@ -231,16 +232,17 @@ class EvanBPC(Controller):
         grad_M = self.grad_M(cost_diff) * d.reshape(1, -1, 1)
         grad_M0 = self.grad_M0(cost_diff) * d.reshape(-1)
         grad_K = self.grad_K(cost_diff) * d.reshape(-1, 1)
+        grad_M, grad_M0, grad_K = map(lambda arr: clip(arr), (grad_M, grad_M0, grad_K))  # use updates starting from h steps ago via popping left
         self.grads.append((grad_M, grad_M0, grad_K))
         if len(self.grads) == self.grads.maxlen:
-            grad_M, grad_M0, grad_K = map(lambda arr: clip(arr), self.grads.popleft())  # use updates starting from h steps ago via popping left
-            self.M += self.M_update_rescaler.step(grad_M, iterate=self.M)
+            grad_M, grad_M0, grad_K = self.grads.popleft()  # use updates starting from h steps ago via popping left
+            self.M -= self.M_update_rescaler.step(grad_M, iterate=self.M)
             self.M0 -= self.M0_update_rescaler.step(grad_M0, iterate=self.M0)
             self.K -= self.K_update_rescaler.step(grad_K, iterate=self.K)  # note that this is minus since  u = -K @ x + ...
             
         # 4. ensure norms are good
         self.M = clip(self.M, 'M')
-        # self.K = clip(self.K, 'K')
+        self.K = clip(self.K, 'K')
         self.M0 = clip(self.M0, 'M0')
             
         self.stats.update('disturbances', disturbance, t=self.t)
@@ -292,15 +294,15 @@ class LQR(_LQR):
         super().__init__(*args, **kwargs)
         self.control_dim, self.state_dim = self.K.shape
 
-        self.t = 0
         self.stats = Stats()
+        self.t = 0
         self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
-        self.stats.update('states', state, t=self.t)
         self.t += 1
+        self.stats.update('states', state, t=self.t)
         return self(state)
     
     def system_reset_hook(self): pass
@@ -407,7 +409,7 @@ class RBPC(Controller):  # from Udaya
         if R is None: R = jnp.eye(m)
         self.n, self.m = n, m
         self.lr, self.A, self.B, self.M, self.H, self.noise_sd = lr, A, B, M, H, noise_sd
-        self.x, self.u, self.delta, self.t = jnp.zeros((n, 1)), jnp.zeros((m, 1)), delta, 0
+        self.x, self.u, self.delta = jnp.zeros((n, 1)), jnp.zeros((m, 1)), delta
         self.K, self.E, self.W = LQR(A, B, Q, R).K, jnp.zeros((M, n, m)), jnp.zeros((M + H -1, n))
         self.eps = sample(jkey(), (self.M, self.m), 'sphere')
         self.cost = 0.

@@ -112,8 +112,11 @@ def get_classname(obj):
 def summarize_lds(A, B):
     s = ''
     s += '||A||_op = {}'.format(opnorm(A))
-    s += '\n||B||_F = {}'.format(jnp.linalg.norm(B))
-    s += '\n||A-BK||_op = {}'.format(opnorm(A - B @ dare_gain(A, B)))
+    s += '\n||B||_F = {}'.format(jnp.linalg.norm(B, ord='fro'))
+    try:
+        s += '\n||A-BK||_op = {}'.format(opnorm(A - B @ dare_gain(A, B)))
+    except:
+        s += '\n||A-BK||_op folded (couldnt find finite solution)'
     return s
 
 def opnorm(X):
@@ -151,17 +154,18 @@ def method_of_moments(xs: jnp.ndarray,
     runs method of moments to find A, B s.t.
         `A @ x_{t} + B @ u_{t} = x_{t+1}`
     """
-    k = int(0.15 * len(xs))
-    scan_len = len(xs) - k - 1 # need extra -1 because we iterate over j = 0, ..., k
+    T0 = xs.shape[0]
+    k = max(int(0.01 * T0), 5)
+    scan_len = T0 - k - 1
     
     if isinstance(xs, torch.Tensor):
         # prepare vectors and retrieve B
-        N_j = torch.stack([xs[j: j + scan_len].T @ us[:scan_len] for j in range(k + 1)], dim=0) / scan_len
+        N_j = torch.stack([xs[j + 1: j + scan_len + 1].T @ us[:scan_len] for j in range(1, k + 1)], dim=0) / scan_len
         B = N_j[0]
         
         # retrieve A
         C_0, C_1 = N_j[:-1], N_j[1:]
-        C_inv = torch.linalg.inv(torch.tensordot(C_0, C_0, dims=((0, 2), (0, 2))) + 1e-3 * torch.eye(xs.shape[1]))
+        C_inv = torch.linalg.inv(torch.tensordot(C_0, C_0, dims=((0, 2), (0, 2))) + 1e-6 * torch.eye(xs.shape[1]))
         A = torch.tensordot(C_1, C_0, dims=((0, 2), (0, 2))) @ C_inv
         return A, B
         
@@ -169,12 +173,12 @@ def method_of_moments(xs: jnp.ndarray,
         xs, us = jnp.array(xs), jnp.array(us)
         
     # prepare vectors and retrieve B
-    N_j = jnp.array([jnp.dot(xs[j: j + scan_len].T, us[:scan_len]) for j in range(k + 1)]) / scan_len
+    N_j = jnp.array([jnp.dot(xs[j + 1: j + scan_len + 1].T, us[:scan_len]) for j in range(k + 1)]) / scan_len
     B = N_j[0] # jnp.dot(states[1:].T, eps[:-1]) / (self.t - 1)
 
     # retrieve A
     C_0, C_1 = N_j[:-1], N_j[1:]
-    C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-3 * jnp.identity(xs.shape[1]))
+    C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-6 * jnp.identity(xs.shape[1]))
     A = jnp.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
     
     return A, B
@@ -278,8 +282,10 @@ def sample(jkey: jax.random.KeyArray,
            shape,
            sampling_method=SAMPLING_METHOD) -> jnp.ndarray:
     assert sampling_method in ['ball', 'sphere', 'rademacher', 'normal']
+    assert len(shape) > 0
     if sampling_method == 'ball':
-        v = jax.random.ball(jkey, np.prod(shape), dtype=jnp.float32).reshape(*shape)
+        if len(shape) == 1: v = jax.random.ball(jkey, d=shape[0], dtype=jnp.float32).reshape(*shape)
+        else: v = jax.random.ball(jkey, np.prod(shape[1:]), shape=shape[:1], dtype=jnp.float32).reshape(*shape)  # if dim >= 2, assumes batch and flatten rest
     elif sampling_method == 'sphere':
         assert len(shape) <= 2, 'expected either 1D vector or 2D with a batch dim'
         v = jax.random.normal(jkey, shape, dtype=jnp.float32)

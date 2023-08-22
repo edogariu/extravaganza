@@ -29,8 +29,8 @@ class Trajectory:
         while len(self.u) < min_len: self.u.append(jnp.zeros(control_dim) if control_dim is not None else None)
     
     def add_state(self, cost: float, state: jnp.ndarray):
-        cost = cost.item() if hasattr(cost, 'item') else cost
-        if abs(cost) > 1e2: cost /= (abs(cost) / 1e2)
+        if hasattr(cost, 'item'): cost = cost.item()
+        # if abs(cost) > 1e2: cost /= (abs(cost) / 1e2)
         self.f.append(cost)
         self.x.append(state)
     
@@ -63,8 +63,6 @@ class Observable:
         obs = self.obs_func(trajectory)
         return obs
     
-    def norm_fn(self, arr: jnp.ndarray):  # default fn to evaluate sq norm of the observable vector
-        return (arr ** 2).sum()
     
 class TimeDelayedObservation(Observable):
     def __init__(self, 
@@ -72,6 +70,7 @@ class TimeDelayedObservation(Observable):
                  use_states: bool,
                  use_controls: bool,
                  use_costs: bool,
+                 use_cost_diffs: bool,
                  use_time: bool,
                  control_dim: int = None,
                  state_dim: int = None,
@@ -88,16 +87,13 @@ class TimeDelayedObservation(Observable):
             obs_dim += hh * control_dim
         if use_costs:
             obs_dim += hh * 1
+        if use_cost_diffs:
+            obs_dim += hh * 1
         if use_time:
             obs_dim += time_embedding_dim
             
-        # figure out at which index in the observation is the most recent cost. if we aren't using costs, default to usual norm
-        if not use_costs: self._cost_idx = slice(0, obs_dim, 1)
-        elif use_time: self._cost_idx = slice(-(1 + time_embedding_dim), -time_embedding_dim, 1)
-        else: self._cost_idx = slice(-1, obs_dim, 1)
-
         def obs_func(trajectory: Trajectory):
-            if any([len(l) < hh for l in [trajectory.x, trajectory.u, trajectory.f]]): trajectory.pad(hh, control_dim, state_dim)
+            if any([len(l) <= hh for l in [trajectory.x, trajectory.u, trajectory.f]]): trajectory.pad(hh + 1, control_dim, state_dim)
             obs = []
             if use_states: 
                 t = trajectory.x[-hh:]
@@ -111,6 +107,10 @@ class TimeDelayedObservation(Observable):
                 t = trajectory.f[-hh:]
                 for _t in t: assert isinstance(_t, float), _t.__class__
                 obs.append(jnp.array(t))
+            if use_cost_diffs: 
+                for _t in trajectory.f[-hh:]: assert isinstance(_t, float), _t.__class__
+                t = jnp.stack(trajectory.f[-hh:], axis=0) - jnp.stack(trajectory.f[-hh - 1:-1], axis=0)
+                obs.append(t)
             if use_time: 
                 t = (1 + len(trajectory.u)) // 3
                 emb = timestep_embedding(jnp.array([[t],]), embedding_dim=time_embedding_dim, method='sin')
@@ -123,9 +123,6 @@ class TimeDelayedObservation(Observable):
         
         super().__init__(obs_func, obs_dim)
         self.hh = hh
-        
-    def norm_fn(self, arr: jnp.ndarray):
-        return (arr[self._cost_idx] ** 2).sum()
         
 class FullObservation(Observable):
     def __init__(self, 
