@@ -117,15 +117,17 @@ def summarize_lds(A, B):
         s += '\n||A-BK||_op = {}'.format(opnorm(A - B @ dare_gain(A, B)))
     except:
         s += '\n||A-BK||_op folded (couldnt find finite solution)'
+    s += '\neig(A) = {}'.format(np.sort([jnp.linalg.norm(e) for e in jnp.linalg.eigvals(A)])[::-1])
+    s += '\nsvd(B) = {}'.format(jnp.linalg.svd(B)[1])
     return s
 
 def opnorm(X):
     if isinstance(X, torch.Tensor):
-        return torch.amax(torch.abs(torch.linalg.eigvals(X)))
+        return torch.amax(torch.abs(torch.linalg.svd(X).S))
     elif isinstance(X, np.ndarray):
-        return np.amax(np.abs(np.linalg.eigvals(X)))
+        return np.amax(np.abs(np.linalg.svd(X)[1]))
     elif isinstance(X, jnp.ndarray):
-        return jnp.amax(jnp.abs(jnp.linalg.eigvals(X))).item()
+        return jnp.amax(jnp.abs(jnp.linalg.svd(X)[1])).item()
     else:
         raise NotImplementedError(X.__class__)
     

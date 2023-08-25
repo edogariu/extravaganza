@@ -328,7 +328,7 @@ class LDS(DynamicalSystem):
         self.R = R if R is not None else jnp.identity(control_dim)
         assert self.R.shape == (control_dim, control_dim)
         self.cost_fn = lambda x, u: cost_fn(x) #+ u.T @ self.R @ u
-        logging.info('(LDS) for the LDS we are !!!NOT!!! reporting the costs with the `u.T @ R @ u` part')
+        logging.debug('(LDS) for the LDS we are !!!NOT!!! reporting the costs with the `u.T @ R @ u` part')
         
         # figure out stats to keep track of
         self.t = 0
@@ -341,7 +341,7 @@ class LDS(DynamicalSystem):
         
         # figure out init
         self.initial_state = jax.random.normal(jkey(), (state_dim,))
-        logging.info('({}): initial state is {}'.format(get_classname(self), self.initial_state))
+        logging.debug('({}): initial state is {}'.format(get_classname(self), self.initial_state))
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass
     
