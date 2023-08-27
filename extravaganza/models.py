@@ -218,8 +218,8 @@ class TorchLifter(nn.Module):
         if decoder is not None: 
             assert decoder.output_dim == x_dim, 'inconsistent dims'
             logging.info('(LIFTER): decoder provided, so reconstruction error WILL be computed')
-            assert (decoder.input_dim - z_dim) % u_dim == 0
-            self.hh = (decoder.input_dim - z_dim) // u_dim
+            assert decoder.input_dim % z_dim == 0
+            self.hh = decoder.input_dim // z_dim
         self.obs_dim, self.state_dim, self.control_dim, self.latent_dim = x_dim, z_dim, u_dim, encoder.output_dim
         
         if self.latent_dim != z_dim:
@@ -249,14 +249,14 @@ class TorchLifter(nn.Module):
             num_iters, batch_size = 2000, 64
             decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=0.002)
             losses = []
+            latents = []
             for _ in range(num_iters):
                 decoder_opt.zero_grad()
-                x = torch.randn((batch_size, x_dim))
-                us = torch.randn((batch_size, self.hh, u_dim))
-                f = torch.rand((batch_size,)) * 2
-                _, latent = self.encode(x, sq_norms=f)
-                inps = torch.concatenate((latent, us.reshape(batch_size, -1)), dim=-1)
-                loss = torch.nn.functional.mse_loss(self.decoder(inps), x)
+                xs = torch.randn((batch_size, self.hh, x_dim))
+                fs = torch.rand((batch_size * self.hh,)) * 2
+                _, latents = self.encode(xs.reshape(-1, x_dim), sq_norms=fs)
+                inps = latents.reshape(batch_size, -1)
+                loss = torch.nn.functional.mse_loss(self.decoder(inps), xs[:, -1])
                 loss.backward()
                 decoder_opt.step()
                 losses.append(loss.item())
@@ -362,15 +362,15 @@ class TorchLifter(nn.Module):
         latent_gt = latent[1:]
         
         A, B = self.get_AB(latent, controls, mask)
-        if self.AB_method == 'learned': 
-            _A, _B = least_squares(latent, controls, mask)
-            losses['consistency'] = torch.norm(A - _A) ** 2 + torch.norm(B - _B) ** 2
+        # if self.AB_method == 'learned': 
+        #     _A, _B = least_squares(latent, controls, mask)
+        #     losses['consistency'] = torch.norm(A - _A) ** 2 + torch.norm(B - _B) ** 2
 
         # estimate linear predicted embeddings in the LATENT SPACE
         latent_hat = (A @ latent_prev.unsqueeze(-1) + B @ controls[:-1].unsqueeze(-1)).squeeze(-1)
         
         # perturb the g.t. next state encoding, see Section 4.2 of PC3 paper
-        if self.sigma > 0: latent_gt = latent_gt + self.sigma * torch.randn_like(latent_gt)
+        if self.sigma > 0: z = z + self.sigma * torch.randn_like(z)
         
         if self.do_cpc: 
             # losses['cpc'] = self.cpc_loss(latent_hat[mask], latent_gt[mask])
@@ -382,9 +382,11 @@ class TorchLifter(nn.Module):
         # ---------------------------
         
         if self.decoder is not None: 
-            past_hh_controls = torch.stack([controls[i-self.hh:i] for i in range(self.hh, len(controls) + 1)], dim=0).reshape(-1, self.hh * self.control_dim)
-            inps = torch.concatenate((z[self.hh-1:-1], past_hh_controls[:-1]), dim=-1)
-            losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(inps[mask[self.hh-1:]]), obs[self.hh-1:-1][mask[self.hh-1:]]) # torch.nn.functional.mse_loss(self.decoder(latent_prev[mask]), obs[:-1][mask])
+            # past_hh_controls = torch.stack([controls[i-self.hh:i] for i in range(self.hh, len(controls) + 1)], dim=0).reshape(-1, self.hh * self.control_dim)
+            # inps = torch.concatenate((z[self.hh-1:-1], past_hh_controls[:-1]), dim=-1)
+            past_hh_states = torch.stack([z[i-self.hh:i] for i in range(self.hh, len(z))], dim=0).reshape(-1, self.hh * self.state_dim)
+            _m = mask[self.hh-1:]
+            losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(past_hh_states[_m]), obs[self.hh-1:-1][_m]) # torch.nn.functional.mse_loss(self.decoder(latent_prev[mask]), obs[:-1][mask])
         
         if self.latent_dim != self.state_dim:
             losses['proj_isometry'] = torch.nn.functional.mse_loss(torch.linalg.svd(self.proj).S, torch.ones(self.state_dim))

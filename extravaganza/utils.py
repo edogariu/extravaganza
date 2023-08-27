@@ -36,7 +36,7 @@ COLORS = {
           'Linear': 'brown',
           'Lifted': 'm'}
 
-SAMPLING_METHOD = 'ball'  # must be in `['ball', 'sphere', 'rademacher', 'normal']``
+SAMPLING_METHOD = 'normal'  # must be in `['ball', 'sphere', 'rademacher', 'normal']``
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def render(experiment, xkey, ykey, sliderkey: str = None, save_path: str = None, duration: float = 5, fps: int = 30):

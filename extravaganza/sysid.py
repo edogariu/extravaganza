@@ -23,27 +23,29 @@ LOSS_WEIGHTS = {
     # touch these
     'isometry': 0,
     'jac': 0,
+    'dot': 0,
     'jac_conditioning': 0,
     'l2 linearization': 1,
+    'l2 linearization relative': 0,
     'l1 linearization': 0,
     'reconstruction': 0,
     'injectivity': 0,
     'surjectivity': 0,
-    'cpc': 1,
-    'guess the control': 0,
+    'cpc': 0,
+    'guess the control': 1,
     'simplification': 1,
     'residual centeredness': 0,
-    'centeredness': 0.01,
+    'centeredness': 0,
     
     # dont touch these
-    'consistency': 1,
+    'consistency': 0.01,
     'proj_isometry': 1,
     'proj_error': 1,
 }
-ISOMETRIC_LATENT_SPACE = False
-GET_LATENT_DIM = lambda state_dim: state_dim + 1
+ISOMETRIC_LATENT_SPACE = True
+GET_LATENT_DIM = lambda state_dim: 2 * state_dim + 1
 
-GEN_LENGTH = 5000
+GEN_LENGTH = 10000
 DO_RESET_MASK_DEBUG = False  # to confirm whether the reset masks are correct. can only be used with CartPole
 IF_ISOMETRIC = lambda t: t if ISOMETRIC_LATENT_SPACE else None  # to avoid always typing this
 
@@ -276,7 +278,11 @@ class Lifter(SystemModel):
             self.num_iters = num_iters
             self.batch_size = batch_size
             
-            for i in range(self.hh): LOSS_WEIGHTS['simplification {}'.format(i)] = LOSS_WEIGHTS['simplification']
+            for i in range(self.hh): 
+                LOSS_WEIGHTS[f'l2 linearization {i}'] = LOSS_WEIGHTS['l2 linearization']
+                LOSS_WEIGHTS[f'l2 linearization relative {i}'] = LOSS_WEIGHTS['l2 linearization relative']
+                LOSS_WEIGHTS[f'l1 linearization {i}'] = LOSS_WEIGHTS['l1 linearization']
+                LOSS_WEIGHTS[f'simplification {i}'] = LOSS_WEIGHTS['simplification']
             
             latent_dim = GET_LATENT_DIM(self.state_dim)  # always be linearizing in a higher dimension
             layer_dims = [self.obs_dim, *[5 * latent_dim for _ in range(depth - 1)], latent_dim]
@@ -287,7 +293,7 @@ class Lifter(SystemModel):
                            use_bias=True,
                            seed=seed)
             if LOSS_WEIGHTS['reconstruction'] > 0:
-                layer_dims.append(self.state_dim + hh * self.control_dim); layer_dims.reverse()
+                layer_dims.append(self.state_dim * hh); layer_dims.reverse()
                 dec = TorchMLP(layer_dims,
                                activation=torch.nn.Tanh,
                             #    normalization=torch.nn.LayerNorm,
@@ -296,13 +302,13 @@ class Lifter(SystemModel):
                                dropout=0,
                                seed=seed)
             else: dec = None
-            if ISOMETRIC_LATENT_SPACE: logging.info('(LIFTER): we are imposing simplification as a hard constraint via isometric NN')
+            if ISOMETRIC_LATENT_SPACE: logging.info('(LIFTER): we are imposing simplification as a hard constraint on the latent space via isometric NN')
             self.lifter = TorchLifter(enc, self.obs_dim, self.control_dim, self.state_dim, 
                                    AB_method=AB_method, decoder=dec, sigma=sigma, deterministic_encoder=deterministic_encoder, 
                                    do_cpc=LOSS_WEIGHTS['cpc'] > 0, 
                                    do_jac=LOSS_WEIGHTS['jac'] > 0,
                                    do_jac_conditioning=LOSS_WEIGHTS['jac_conditioning'] > 0).float()
-            self.lifter_opt = torch.optim.AdamW(self.lifter.parameters(), lr=lifter_lr, weight_decay=1e-5)
+            self.lifter_opt = torch.optim.AdamW(self.lifter.parameters(), lr=lifter_lr, weight_decay=1e-3)
 
         else: raise NotImplementedError(method)
         
@@ -316,12 +322,13 @@ class Lifter(SystemModel):
         states, controls, costs = self.concatenate_trajectories()
         assert states.shape[0] == controls.shape[0] and states.shape[0] == costs.shape[0]
         
-        # find the index of the last datapoint in each trajectory. we will ignore loss terms referencing x_t and x_{t+1} for all t in ignore_idxs,
+        # find the index of the last datapoint in each trajectory. we will ignore loss terms referencing x_{t-hh}, ..., x_{t+hh} (inclusive) for all t in ignore_idxs,
         # since a reset happened between those two points
         traj_lens = [len(traj) for traj in self.trajs]
         ignore_idxs = np.cumsum(traj_lens) - 1  # -1 to capture last idxs of old trajs, not first idxs of new trajs
         mask = np.ones(states.shape[0], dtype=bool)
-        for idx in ignore_idxs: mask[idx: idx + self.hh] = False
+        for idx in ignore_idxs: mask[max(0, idx - self.hh + 1): idx + self.hh + 1] = False  # anything within +/- hh of a reset must go
+        mask[:self.hh] = False  # the first hh must go
         mask = mask[:-1]
         
         if DO_RESET_MASK_DEBUG:
@@ -340,7 +347,7 @@ class Lifter(SystemModel):
         if self.method == 'identity':
             self.AB['regression'] = least_squares(states, controls, mask=mask, max_opnorm=MAX_OPNORM)
             self.AB['moments'] = method_of_moments(states, controls, mask=mask)
-            ret = self.AB['regression']
+            ret = 'regression'
         
         elif self.method in KOOPMAN_METHODS:
             x, u = np.array(states), np.array(controls)
@@ -350,7 +357,7 @@ class Lifter(SystemModel):
             self.AB['regression'] = least_squares(z, u, mask=mask, max_opnorm=MAX_OPNORM) 
             self.AB['moments'] = method_of_moments(z, u, mask=mask)           
             self.AB['koopman'] = (jnp.array(self.model.A.reshape(self.state_dim, self.state_dim)), jnp.array(self.model.B.reshape(self.state_dim, self.control_dim)))
-            ret = self.AB['regression']
+            ret = 'regression'
             
         elif self.method == 'nn':  
                      
@@ -398,67 +405,86 @@ class Lifter(SystemModel):
                 (z, zhat), (A, B), losses = self.lifter.get_embs_and_losses(x, u, sq_norms=IF_ISOMETRIC(f), mask=mask)   
                 zprev, zgt = z[:-1], z[1:]
                 
-                # linearization error
-                disturbances = (zgt - zhat)[mask]
-                
                 # how well the squared norm represents cost
-                if LOSS_WEIGHTS['simplification'] > 0: 
-                    losses['simplification'] = torch.nn.functional.mse_loss(torch.norm(zprev[mask], dim=-1) ** 2, f[:-1][mask])
+                simp, l2, l1 = LOSS_WEIGHTS['simplification'] > 0, LOSS_WEIGHTS['l2 linearization'] > 0 or LOSS_WEIGHTS['l2 linearization relative'] > 0, LOSS_WEIGHTS['l1 linearization'] > 0
+                if any((simp, l2, l2)): 
+                    if simp: losses['simplification'] = torch.nn.functional.mse_loss(torch.norm(zprev[mask], dim=-1) ** 2, f[:-1][mask])
                     _z = z[:-self.hh]
                     for i in range(self.hh):
                         l, r = i, len(z) - self.hh + i
                         _m = mask[l:r]
                         _z = (A @ _z.unsqueeze(-1) + B @ u[l:r].unsqueeze(-1)).squeeze(-1)
-                        losses[f'simplification {i}'] = torch.nn.functional.mse_loss(torch.norm(_z[_m], dim=-1) ** 2, f[l+1:r+1][_m])
+                        if l2: 
+                            if LOSS_WEIGHTS['l2 linearization'] > 0: losses[f'l2 linearization {i}'] = torch.nn.functional.mse_loss(_z[_m], z[l+1:r+1][_m])
+                            if LOSS_WEIGHTS['l2 linearization relative'] > 0: losses[f'l2 linearization relative {i}'] = torch.mean((torch.norm(_z[_m] - z[l+1:r+1][_m], dim=-1) ** 2) / (torch.norm(z[l+1:r+1][_m], dim=-1) ** 2))
+                        if l1: losses[f'l1 linearization {i}'] = torch.nn.functional.l1_loss(_z[_m], z[l+1:r+1][_m])
+                        if simp: losses[f'simplification {i}'] = torch.nn.functional.mse_loss(torch.norm(_z[_m], dim=-1) ** 2, f[l+1:r+1][_m])
                 
-                if LOSS_WEIGHTS['l2 linearization'] > 0: losses['l2 linearization'] = torch.nn.functional.mse_loss(disturbances, torch.zeros_like(disturbances))
-                if LOSS_WEIGHTS['l1 linearization'] > 0: losses['l1 linearization'] = torch.nn.functional.l1_loss(disturbances, torch.zeros_like(disturbances))
+                if LOSS_WEIGHTS['dot'] > 0:  # compares empirical expectation to the theoretical one
+                    diffs = (zgt - zprev)[mask]
+                    diffs = (B.T @ diffs.unsqueeze(-1)).squeeze(-1)
+                    RHS = (self.explorer.exploration_scales.item() * torch.norm(B, p='fro')) ** 2                    
+                    LHS = (diffs * u[:-1][mask]).sum(dim=-1).mean()
+                    losses['dot'] = torch.nn.functional.mse_loss(LHS, RHS)
                 
                 # how well we can reproduce the controls we used --   znext = A @ z + B @ u  ->  B^-1_left @ (znext - A @ z) = u
                 if LOSS_WEIGHTS['guess the control'] > 0:
                     pinv = torch.linalg.pinv(B)
                     assert torch.allclose(pinv @ B, torch.eye(B.shape[1]), rtol=1e-1, atol=1e-1), (pinv @ B)
+                    pinv = torch.clamp(pinv, -1e2, 1e2)
                     uhat = (pinv @ (zgt.unsqueeze(-1) - (A @ zprev.unsqueeze(-1)))).squeeze(-1) 
                     losses['guess the control'] = torch.nn.functional.mse_loss(uhat[mask], u[:-1][mask])
                 
                 # injectivity proxy to penalize instances where two observations are distinct but are embedded similarly
                 if LOSS_WEIGHTS['injectivity'] > 0:
+                    _threshold = 1e-2
                     _x, _z = x[:-1][mask], zprev[mask]
-                    _z = _z / torch.norm(_z, dim=-1).mean()
-                    # obs_sq_dists = (torch.cdist(_x.unsqueeze(0), _x.unsqueeze(0)).squeeze(0) ** 2).reshape(-1)
+                    # _z = _z / torch.norm(_z, dim=-1).mean()
+                    obs_sq_dists = torch.triu(torch.cdist(_x.unsqueeze(0), _x.unsqueeze(0)).squeeze(0) ** 2, diagonal=1).reshape(-1)
                     emb_sq_dists = torch.triu(torch.cdist(_z.unsqueeze(0), _z.unsqueeze(0)).squeeze(0) ** 2, diagonal=1).reshape(-1)
-                    # _mask = (emb_sq_dists < threshold) & (obs_sq_dists > 0)
+                    _mask = obs_sq_dists > _threshold
                     # losses['injectivity'] = torch.corrcoef(torch.vstack((obs_sq_dists, emb_sq_dists)))[0, 1] ** 2 
-                    losses['injectivity'] = (1 / (emb_sq_dists + 1e-6)).mean()
+                    # losses['injectivity'] = (1 / (emb_sq_dists + 1e-6)).mean()
+                    losses['injectivity'] = (obs_sq_dists / (emb_sq_dists + 1e-6))[_mask].mean()
                 
                 # surjectivity proxy to ensure embeddings span their output space by ensuring their dimensions are uncorrelated
                 if LOSS_WEIGHTS['surjectivity'] > 0:
                     assert self.state_dim > 1
-                    _z = zprev[mask] / torch.norm(zprev[mask], dim=-1).unsqueeze(-1)
-                    
+                    _z = zprev[mask]
+                    _z = _z / torch.norm(_z, dim=-1).unsqueeze(-1)
                     # _loss = 1 / (1e-7 + torch.linalg.det(_z.T @ _z))
-                    _loss = torch.norm(torch.triu(_z @ _z.T, diagonal=1))
+                    # _loss = torch.norm(torch.triu(_z @ _z.T, diagonal=1))
+                    _loss = torch.abs(torch.mean(torch.triu(_z.T @ _z, diagonal=1)))
                     
                     losses['surjectivity'] = _loss # 2 * torch.triu(torch.abs(gram), diagonal=1).sum() / (_n ** 2 - _n) #(obs_sq_dists[_mask] / (emb_sq_dists[_mask] + 1e-3 * threshold)).mean() if _mask.sum() > 0 else torch.tensor(0.)
                     
                 if LOSS_WEIGHTS['isometry'] > 0:  # check the overleaf for this one boss :)
-                    _f = torch.sqrt(f)
-                    a, b = opnorm(A - torch.eye(A.shape[0])), opnorm(B)
-                    prev_norms, next_norms = _f[:-1], _f[1:]
-                    u_norms = torch.norm(u[:-1], dim=-1)
-                    with torch.no_grad():
-                        LHS = (next_norms ** 2 + prev_norms ** 2 - (a * prev_norms + b * u_norms) ** 2) / 2
-                        RHS = next_norms * prev_norms
-                        _mask = (LHS < RHS) & mask
-                        LHS, RHS = LHS[_mask], RHS[_mask]
-                    dots = (zprev[_mask] * zgt[_mask]).sum(dim=-1)
-                    dists = torch.square(dots - LHS)[dots < LHS].sum()  # outside interval and left boundary is closest
-                    dists = dists + torch.square(dots - RHS)[dots > RHS].sum()  # outside interval and right boundary is closest
-                    losses['isometry'] = dists / (1 + _mask.sum())
+                    
+                    diffs = zgt - zprev
+                    bus = (B @ u[:-1].unsqueeze(-1)).squeeze(-1)
+                    LHS = (diffs * bus).sum(dim=-1)
+                    
+                    axs = ((A - torch.eye(A.shape[0])) @ zprev.unsqueeze(-1)).squeeze(-1)
+                    RHS = torch.norm(bus, dim=-1) ** 2 + (axs * bus).sum(dim=-1)
+                    losses['isometry'] = torch.nn.functional.mse_loss(LHS, RHS)
+                    
+                    # _f = torch.sqrt(f)  # unsquared norms
+                    # a, b = opnorm(A - torch.eye(A.shape[0])), opnorm(B)
+                    # prev_norms, next_norms = _f[:-1], _f[1:]
+                    # u_norms = torch.norm(u[:-1], dim=-1)
+                    # with torch.no_grad():
+                    #     LHS = torch.abs(next_norms - prev_norms)
+                    #     RHS = a * prev_norms + b * u_norms
+                    #     _mask = mask & (LHS < RHS)
+                    #     LHS, RHS = LHS[_mask], RHS[_mask]
+                    # d = torch.norm(zgt - zprev, dim=-1)[_mask]
+                    # dists = torch.square(d - LHS)[d < LHS].sum()  # outside interval and left boundary is closest
+                    # dists = dists + torch.square(d - RHS)[d > RHS].sum()  # outside interval and right boundary is closest
+                    # losses['isometry'] = dists / (1 + _mask.sum())
                     
                 # centeredness
-                if LOSS_WEIGHTS['residual centeredness'] > 0: losses['residual centeredness'] = torch.linalg.norm(disturbances.mean(dim=0)) ** 2  # sq norm of mean residual
-                if LOSS_WEIGHTS['centeredness'] > 0: losses['centeredness'] = torch.linalg.norm(z.mean(dim=0)) ** 2  # sq norm of mean embedding
+                if LOSS_WEIGHTS['residual centeredness'] > 0: losses['residual centeredness'] = torch.norm((zhat - zgt).mean(dim=0)) ** 2  # sq norm of mean residual
+                if LOSS_WEIGHTS['centeredness'] > 0: losses['centeredness'] = torch.norm(z.mean(dim=0)) ** 2 / (torch.norm(z, dim=-1) ** 2).mean()  # sq norm of mean embedding
                 
                 loss = 0.
                 for k, v in losses.items(): 
@@ -470,7 +496,8 @@ class Lifter(SystemModel):
                 
                 if i_iter % print_every == 0 or i_iter == self.num_iters - 1:
                     logging.info('mean loss for iters {} - {}:'.format(i_iter - print_every, i_iter))
-                    for k, v in overall_losses.items(): logging.info('\t\t{}: {}'.format(k, np.mean(v[-print_every:])))
+                    ks = sorted(overall_losses.keys())
+                    for k in ks: logging.info('\t\t{}: \t{}'.format(k, np.mean(overall_losses[k][-print_every:])))
 
             # identify the system dynamics at the end
             with torch.no_grad():
@@ -486,19 +513,18 @@ class Lifter(SystemModel):
                         _A, _B = _P @ _A @ np.linalg.pinv(_P), _P @ _B
                     self.AB['learned'] = _A, _B
                     logging.info('(LIFTER): fmean = {}'.format(fmean))
-                    # ret = self.AB['learned']
-                    ret = self.AB['regression']
+                    ret = 'regression'
                 else:
-                    ret = self.AB['regression']
+                    ret = 'regression'
             
-        if wordy: 
+        if wordy:
             for k, v in self.AB.items():
-                print(k + ':')
+                print('{}{} :'.format(k, ' (ret)' if k == ret else ''))
                 print(summarize_lds(*v))
                 print()
         
         self.trained = True
-        self.A, self.B = map(lambda arr: jnp.array(arr), ret)
+        self.A, self.B = map(lambda arr: jnp.array(arr), self.AB[ret])
         return self.A, self.B
     
     def get_state(self, 

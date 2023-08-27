@@ -108,9 +108,6 @@ class Experiment:
             stats.register('observations', obj_class=jnp.ndarray, shape=(observable.obs_dim,))
             stats.register('true states')  # we don't know apriori if the states will be arrays, None, strings, ???
             
-            # initial control
-            control = controller.initial_control if hasattr(controller, 'initial_control') else jnp.zeros(controller.control_dim)  
-            
             # for rendering
             if render_every is None:
                 def render(t, cost, state): return  # no-op
@@ -154,6 +151,7 @@ class Experiment:
             traj = Trajectory()
             # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
             cost, obs = 0., jnp.zeros(observable.obs_dim)
+            control = controller.initial_control if hasattr(controller, 'initial_control') else jnp.zeros(controller.control_dim)  
             for t in pbar:
                 if t == 0 or reset_condition(t):
                     logging.info('(EXPERIMENT): reset at t={}!'.format(t))
