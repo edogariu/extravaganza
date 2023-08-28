@@ -1,5 +1,8 @@
 import logging
 from typing import List, Iterable
+from copy import deepcopy
+
+import numpy as np
 
 from extravaganza.utils import set_seed, jkey, least_squares, method_of_moments, opnorm
 
@@ -101,6 +104,7 @@ class TorchMLP(nn.Module):
         
         self.input_dim = layer_dims[0]
         self.output_dim = layer_dims[-1]
+        self.layer_dims = layer_dims
         self.use_bias = use_bias
         
         self.layers = [nn.Flatten(1)]
@@ -200,76 +204,73 @@ class TorchLifter(nn.Module):
                  x_dim: int,
                  u_dim: int,
                  z_dim: int,
-                 AB_method: str = 'learned',
-                 sigma: float = 0,
-                 deterministic_encoder: bool = False,
-                 decoder: TorchMLP = None, 
-                 do_cpc: bool = False,
-                 do_jac: bool = False,
-                 do_jac_conditioning: bool = False):
+                 latent_dim: int,
+                 
+                 hh: int,
+                 
+                 loss_weights,
+                 isometric: bool,
+                 deterministic: bool,
+                 AB_method: str,
+                 sigma: float):
+        """
+        - if `latent_dim > z_dim`, we linearize in `latent_dim` and linearly (hopefully isometrically) project down to `z_dim`.
+                    In this case, we refer to vectors before the projection as "latents" and after as "embeddings" or "z"
+        - if `not determistic`, we predict mu and sigma to define a normal distribution. Otherwise, we set `sigma = 0`.
+        - if `isometric`, we do as above and then divide by the norm to get a unit vector, that we multiply by its desired norm
+        """
         super().__init__()
-
+        
+        assert encoder.input_dim == x_dim and encoder.output_dim == latent_dim, 'inconsistent dims'
+        self.obs_dim, self.state_dim, self.control_dim, self.latent_dim = x_dim, z_dim, u_dim, latent_dim
+        self.isometric, self.determinstic = isometric, deterministic
         self.encoder = encoder
-        self.decoder = decoder
-        
-        # self.inv_proj = nn.Linear(z_dim, encoder.output_dim); self.dec2 = lambda x: self.decoder(self.inv_proj(x)) # REMOVE THIS
-        
-        assert encoder.input_dim == x_dim, 'inconsistent dims'
-        if decoder is not None: 
-            assert decoder.output_dim == x_dim, 'inconsistent dims'
-            logging.info('(LIFTER): decoder provided, so reconstruction error WILL be computed')
-            assert decoder.input_dim % z_dim == 0
-            self.hh = decoder.input_dim // z_dim
-        self.obs_dim, self.state_dim, self.control_dim, self.latent_dim = x_dim, z_dim, u_dim, encoder.output_dim
-        
-        if self.latent_dim != z_dim:
-            assert self.latent_dim > z_dim, (self.latent_dim, z_dim)
-            logging.info('(LIFTER): we will be linearizing in dimension {} and linearly project down to dimension {}'.format(self.latent_dim, z_dim))
-            self.proj = torch.nn.Parameter(torch.randn((z_dim, self.latent_dim), dtype=torch.float32, requires_grad=True))
-        
-        self.do_cpc = do_cpc
-        if self.do_cpc: 
-            """
-            Contrastive predictive coding, see https://arxiv.org/pdf/1807.03748.pdf.
-            """
-            self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired' means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
-            # self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=False)
-            
-        self.do_jac = do_jac
-        self.do_jac_conditioning = do_jac_conditioning
-        if self.do_jac or self.do_jac_conditioning:
-            # assert deterministic_encoder and sigma == 0, 'cannot compute jacobians with random stuff goin on'
-            self.jac_func = torch.func.vmap(torch.func.jacrev(self.encode_aux, argnums=0, has_aux=True), randomness='same')  # jacrev is ~2x faster
-        
         self.sigma = sigma
-        self.mu = nn.Linear(self.latent_dim, self.latent_dim)
-        self.logvar = nn.Linear(self.latent_dim, self.latent_dim) if not deterministic_encoder else None
+        self.loss_weights = loss_weights
+        self.hh = hh
         
-        if self.decoder is not None and deterministic_encoder and sigma == 0:  # give the decoder a nice initialization
-            num_iters, batch_size = 2000, 64
-            decoder_opt = torch.optim.Adam(self.decoder.parameters(), lr=0.002)
-            losses = []
-            latents = []
-            for _ in range(num_iters):
-                decoder_opt.zero_grad()
-                xs = torch.randn((batch_size, self.hh, x_dim))
-                fs = torch.rand((batch_size * self.hh,)) * 2
-                _, latents = self.encode(xs.reshape(-1, x_dim), sq_norms=fs)
-                inps = latents.reshape(batch_size, -1)
-                loss = torch.nn.functional.mse_loss(self.decoder(inps), xs[:, -1])
-                loss.backward()
-                decoder_opt.step()
-                losses.append(loss.item())
-            import matplotlib.pyplot as plt
-            plt.plot(range(len(losses)), losses)
-            plt.show()
+        # decoder if needed
+        if loss_weights['reconstruction']:  # reconstruct using past `hh` embeddings
+            layer_dims = deepcopy(encoder.layer_dims)
+            layer_dims.append(self.state_dim * hh); layer_dims.reverse()
+            self.decoder = TorchMLP(layer_dims,
+                                    activation=torch.nn.Tanh,
+                                    # normalization=torch.nn.LayerNorm,
+                                    drop_last_activation=True,
+                                    use_bias=True,
+                                    dropout=0)
+         
+        # projection if needed   
+        if self.latent_dim != self.state_dim:
+            assert self.latent_dim > self.state_dim, (self.latent_dim, self.state_dim)
+            logging.info('(LIFTER): we will be linearizing in latent dimension {} and linearly project down to embedding dimension {}'.format(self.latent_dim, self.state_dim))
+            self.proj = torch.nn.Parameter(torch.randn((self.state_dim, self.latent_dim), dtype=torch.float32, requires_grad=True))
             
+        # variational encoding if needed
+        if not deterministic:
+            self.mu = nn.Linear(self.latent_dim, self.latent_dim)
+            self.logvar = nn.Linear(self.latent_dim, self.latent_dim)
+            def get_latent(x):
+                latent = self.encoder(x)
+                mu, logvar = self.mu(latent), self.logvar(latent)
+                return mu + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
+            self.get_latent = get_latent
+        else: self.get_latent = self.encoder
+            
+        if isometric: logging.info('(LIFTER): we are imposing simplification as a hard constraint on the latent space via isometric NN')
+        
+        # some loss functions if needed (Contrastive predictive coding, see https://arxiv.org/pdf/1807.03748.pdf) and (NN jacobian)
+        # self.cpc_loss = InfoNCE(negative_mode='unpaired')  # 'paired' means each anchor gets compared to only its negative, instead of all negatives (for that, change to 'unpaired')
+        self.cpc_loss = SelfSupervisedLoss(ContrastiveLoss(), symmetric=False)
+        self.jac_func = torch.func.vmap(torch.func.jacrev(self.encode_aux, argnums=0, has_aux=True), randomness='same')  # jacrev is ~2x faster
+            
+        # how we get the A and B estimates during each training step
         assert AB_method in ['learned', 'regression_nograd', 'regression', 'moments_nograd', 'moments']
         logging.info('(LIFTER): using "{}" method to get the AB matrices during each training step'.format(AB_method))
         if AB_method == 'learned':
             self.A = torch.nn.Parameter(torch.ones(self.latent_dim, dtype=torch.float32, requires_grad=True))
-            # self.A = torch.nn.Parameter(torch.eye(z_dim, dtype=torch.float32, requires_grad=True))
-            self.B = torch.nn.Parameter(torch.randn((self.latent_dim, u_dim), dtype=torch.float32, requires_grad=True))
+            # self.A = torch.nn.Parameter(torch.eye(self.latent_dim, dtype=torch.float32, requires_grad=True))
+            self.B = torch.nn.Parameter(torch.randn((self.latent_dim, u_dim), dtype=torch.float32, requires_grad=True)) * 1e-6
             self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
             # self.get_AB = lambda xs, us, mask: (self.A, self.B)
         elif AB_method == 'regression_nograd':
@@ -288,24 +289,19 @@ class TorchLifter(nn.Module):
         
     def encode(self, x: torch.Tensor, sq_norms: torch.Tensor = None): 
         unbatch = x.ndim == 1
-        if sq_norms is not None:
-            if not isinstance(sq_norms, torch.Tensor): sq_norms = torch.tensor(sq_norms)
-            if not unbatch:
-                assert sq_norms.shape == (x.shape[0],)
-                assert all(sq_norms >= 0.)
         
         # encode into latent space
         if unbatch: x = x.unsqueeze(0)
         assert x.shape[1] == self.obs_dim, (x.shape, self.obs_dim)
-        latent = self.encoder(x)
-        mu = self.mu(latent)
-        if self.logvar is not None:  # actually sample from trained distribution
-            logvar = self.logvar(latent)
-            latent = mu + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
-        else: latent = mu
+        latent = self.get_latent(x)
         assert latent.shape[1] == self.latent_dim, (latent.shape, self.latent_dim)
         
-        if sq_norms is not None:  # now we must project to the sphere
+        # project to sphere and rescale if we gotta
+        if self.isometric:  # now we must project to the sphere
+            assert sq_norms is not None
+            if not isinstance(sq_norms, torch.Tensor): sq_norms = torch.tensor(sq_norms)
+            if not unbatch: assert sq_norms.shape == (x.shape[0],) and all(sq_norms >= 0.)
+            
             # the classic 'divide by the norm' method, tried and true
             latent = latent / torch.norm(latent, dim=-1).unsqueeze(-1)
             
@@ -323,7 +319,10 @@ class TorchLifter(nn.Module):
             # multiply by radius
             latent = latent * torch.sqrt(sq_norms).unsqueeze(-1)
         
+        # proj down if we gotta
         z = (self.proj @ latent.unsqueeze(-1)).squeeze(-1) if self.latent_dim != self.state_dim else latent
+        
+        # finish
         assert z.shape[1] == self.state_dim, (z.shape, self.state_dim)
         if unbatch: 
             latent = latent.squeeze(0)
@@ -331,15 +330,12 @@ class TorchLifter(nn.Module):
             
         return z, latent
     
-    def encode_aux(self, x: torch.Tensor, sq_norms: torch.Tensor = None): 
+    def encode_aux(self, x: torch.Tensor, sq_norms: torch.Tensor = None):   # helpful for jacobian stuffs
         z, latent = self.encode(x, sq_norms=sq_norms)
         return latent, (z, latent)
     
     def get_embs_and_losses(self, obs, controls, sq_norms = None, mask = None): 
-        """
-        use `prev_mask` for loss terms indexed on the x_t side.
-        use `next_mask` for loss terms indexed on the x_{t+1} side.
-        """
+        
         assert controls.ndim == 2 and controls.shape[1] == self.control_dim, (controls.shape, self.control_dim)
         assert obs.shape[0] == controls.shape[0], (obs.shape[0], controls.shape[0])
         
@@ -348,46 +344,48 @@ class TorchLifter(nn.Module):
         else: mask = torch.ones(obs.shape[0] - 1, dtype=bool)
 
         losses = {}
+        
         # ---------------------------
-        # LATENT SPACE STUFF
+        # LATENT SPACE STUFF (before the projection)
         # ---------------------------
 
         # get our embeddings
-        if self.do_jac or self.do_jac_conditioning: 
-            args = (obs, sq_norms) if sq_norms is not None else (obs,)  # pytorch doesnt like passing None into vmap's fns
+        if self.loss_weights['jac'] or self.loss_weights['jac_conditioning']: 
+            args = (obs, sq_norms) if self.isometric else (obs,)  # pytorch doesnt like passing None into vmap's fns
             jacs, (z, latent) = self.jac_func(*args)  # uses auxiliary for value so we don't compute twice
             if self.latent_dim != self.state_dim: jacs = self.proj @ jacs  # account for projection down so that these jacs are w.r.t. z, not latent
         else: z, latent = self.encode(obs, sq_norms)
         latent_prev = latent[:-1]
         latent_gt = latent[1:]
         
+        # get A and B
         A, B = self.get_AB(latent, controls, mask)
-        # if self.AB_method == 'learned': 
-        #     _A, _B = least_squares(latent, controls, mask)
-        #     losses['consistency'] = torch.norm(A - _A) ** 2 + torch.norm(B - _B) ** 2
-
-        # estimate linear predicted embeddings in the LATENT SPACE
+        if self.AB_method == 'learned' and self.loss_weights['consistency']:   # compare learned A and B to regressed ones
+            _A, _B = least_squares(latent, controls, mask)
+            losses['consistency'] = torch.norm(A - _A) ** 2 + torch.norm(B - _B) ** 2
         latent_hat = (A @ latent_prev.unsqueeze(-1) + B @ controls[:-1].unsqueeze(-1)).squeeze(-1)
-        
-        # perturb the g.t. next state encoding, see Section 4.2 of PC3 paper
-        if self.sigma > 0: z = z + self.sigma * torch.randn_like(z)
-        
-        if self.do_cpc: 
-            # losses['cpc'] = self.cpc_loss(latent_hat[mask], latent_gt[mask])
-            losses['cpc'] = self.cpc_loss(latent_hat[mask], latent_gt[mask], latent_prev[mask])  # contrastive predictive coding -- we want z to be close to zhat and far from zprev
-        if sq_norms is not None: assert torch.allclose(torch.norm(latent, dim=-1) ** 2, sq_norms), (torch.norm(latent, dim=-1) ** 2, sq_norms)
+
+        # latent space contrastive predictive coding -- we want `latent` to be close to `latent_hat` and far from `latent_prev`
+        if self.loss_weights['cpc']: 
+            gt = latent_gt[mask] + self.sigma * torch.randn_like(latent_gt[mask])  # perturb the g.t. next state encoding, see Section 4.2 of PC3 paper
+            losses['cpc'] = self.cpc_loss(latent_hat[mask], gt)
+            # losses['cpc'] = self.cpc_loss(latent_hat[mask], gt, latent_prev[mask])
+            
+        if self.isometric: 
+            assert torch.allclose(torch.norm(latent, dim=-1) ** 2, sq_norms), (torch.norm(latent, dim=-1) ** 2, sq_norms)
+        if self.loss_weights['vmf']:  # VMF regularization
+            unit_vecs = latent / (torch.norm(latent, dim=-1).unsqueeze(-1) + 1e-6)
+            unit_vecs = unit_vecs[sq_norms > 0.005]
+            p, Rbar = unit_vecs.shape[-1], torch.norm(unit_vecs.mean(dim=0))
+            kappa = Rbar * (p - Rbar ** 2) / (1 - Rbar ** 2) # get estimate of kappa from induced VMF distribution, see https://en.wikipedia.org/wiki/Von_Mises–Fisher_distribution
+            kl = kappa - (p // 2 - 1) * np.log(2) # kl divergence between this VMF distribution and the uniform, see Corollary 3.2 from https://arxiv.org/pdf/1502.07104.pdf
+            losses['vmf'] = kl
         
         # ---------------------------
         # EMBEDDING SPACE STUFF (after the proj down, if there is one)
         # ---------------------------
         
-        if self.decoder is not None: 
-            # past_hh_controls = torch.stack([controls[i-self.hh:i] for i in range(self.hh, len(controls) + 1)], dim=0).reshape(-1, self.hh * self.control_dim)
-            # inps = torch.concatenate((z[self.hh-1:-1], past_hh_controls[:-1]), dim=-1)
-            past_hh_states = torch.stack([z[i-self.hh:i] for i in range(self.hh, len(z))], dim=0).reshape(-1, self.hh * self.state_dim)
-            _m = mask[self.hh-1:]
-            losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(past_hh_states[_m]), obs[self.hh-1:-1][_m]) # torch.nn.functional.mse_loss(self.decoder(latent_prev[mask]), obs[:-1][mask])
-        
+        # project down A and B, if needed
         if self.latent_dim != self.state_dim:
             losses['proj_isometry'] = torch.nn.functional.mse_loss(torch.linalg.svd(self.proj).S, torch.ones(self.state_dim))
             temp = self.proj @ A
@@ -398,11 +396,18 @@ class TorchLifter(nn.Module):
             # losses['proj_error'] = torch.norm(A @ self.proj - temp) ** 2
         else: zhat = latent_hat
         
-        if self.do_jac: 
+        # reconstruction error
+        if self.loss_weights['reconstruction']: 
+            past_hh_states = torch.stack([z[i-self.hh:i] for i in range(self.hh, len(z))], dim=0).reshape(-1, self.hh * self.state_dim)
+            _m = mask[self.hh-1:]
+            losses['reconstruction'] = torch.nn.functional.mse_loss(self.decoder(past_hh_states[_m]), obs[self.hh-1:-1][_m]) # torch.nn.functional.mse_loss(self.decoder(latent_prev[mask]), obs[:-1][mask])
+        
+        # jacobian stuff
+        if self.loss_weights['jac']: 
             LHS = (jacs[:-1] @ (obs[1:] - obs[:-1]).unsqueeze(-1)).squeeze(-1)
             RHS = zhat - z[:-1]
             losses['jac'] = torch.nn.functional.mse_loss(LHS[mask], RHS[mask])
-        if self.do_jac_conditioning:
+        if self.loss_weights['jac_conditioning']:
             losses['jac_conditioning'] = (1 / torch.abs(torch.linalg.svd(jacs).S[:, -1])).mean()  # 1 / |sigma_min(J)|
             # losses['jac_conditioning'] = (1 / (1e-4 + torch.linalg.det(jacs[:-1].mT @ jacs[:-1])[mask])).mean()
         

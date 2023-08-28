@@ -93,10 +93,17 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             logging.error('(STATS) failed to concatenate only 1 stat')
             return stats[0]
         
+        _stats = []
+        for i in range(len(stats) - 1): 
+            if stats[i] not in stats[i+1:]:
+                _stats.append(stats[i])
+        _stats.append(stats[-1])
+        
         concatenated_stats = Stats()
         for s in stats:
             assert not s.aggregated, 'cannot concatenate aggregated stats'
-            assert set(concatenated_stats._stats.keys()).isdisjoint(set(s._stats.keys())), 'seems that there is stat overlap'
+            if not set(concatenated_stats._stats.keys()).isdisjoint(set(s._stats.keys())): 
+                print(set(concatenated_stats._stats.keys()).intersection(set(s._stats.keys())))
             concatenated_stats._stats.update(s._stats)
             concatenated_stats._attachments.update(s._attachments)
         return concatenated_stats

@@ -80,7 +80,7 @@ class EvanBPC(Controller):
         assert method in ['FKM', 'REINFORCE']
         assert all(map(lambda i: i >= 0, initial_scales))
         if bounds is not None:
-            bounds = jnp.array(bounds).reshape(2, -1)
+            bounds = jnp.array(bounds).reshape(-1, 2).T
             assert len(bounds[0]) == len(bounds[1]) and len(bounds[0]) == self.control_dim, 'improper bounds'
             assert all(map(lambda i: bounds[0, i] < bounds[1, i], range(self.control_dim))), 'improper bounds'
         
@@ -198,7 +198,7 @@ class EvanBPC(Controller):
         control = -K_tilde @ state + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
         control = self.rescale_u(control)
         if self.bounds is not None: 
-            for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *self.bounds[i]))
+            for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *self.bounds[:, i]))
             # control = jnp.clip(control, *self.bounds)
         
         # update stats
