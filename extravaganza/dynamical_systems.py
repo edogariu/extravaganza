@@ -459,7 +459,7 @@ class Gym(DynamicalSystem):
         self.control_dim = self.env.action_space.shape[0] if self.continuous_action_space else 1
         
         if env_name == 'MountainCarContinuous-v0': self.cost_fn = lambda state: abs(0.45 - state[0])  # L1 distance from flag
-        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: self.cost_fn = lambda state: state[2] ** 2 #+ 0.01 * state[0] ** 2  # MSE of pole angle
+        elif env_name in ['CartPole-v1', 'CartPoleContinuous-v1']: self.cost_fn = lambda state: state[2] ** 2 + 0.01 * state[3] ** 2  # MSE of pole angle
         elif env_name == 'Pendulum-v1': self.cost_fn = lambda state: (jnp.arctan2(state[1], state[0]) ** 2).item() + 0.1 * state[2].item() ** 2  # taken from https://gymnasium.farama.org/environments/classic_control/pendulum/
         else: raise NotImplementedError(env_name)
         self.initial_state, _ = self.env.reset()

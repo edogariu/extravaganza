@@ -106,7 +106,7 @@ class EvanBPC(Controller):
         if use_stabilizing_K:  # initialize state feedback controller as LQR solution to stabilize system
             K = dare_gain(self.A, self.B)
             oppy = opnorm(self.A - self.B @ K)
-            if oppy < 1:
+            if oppy < 10:
                 logging.info('(CONTROLLER): we WILL be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
                 self.K = K
             else: logging.warning('(CONTROLLER): we will NOT be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
@@ -297,13 +297,16 @@ class LQR(_LQR):
         self.stats = Stats()
         self.t = 0
         self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
         pass
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         self.t += 1
+        control = self(state)
         self.stats.update('states', state, t=self.t)
-        return self(state)
+        self.stats.update('-K @ state', control.reshape(self.control_dim), t=self.t)
+        return control
     
     def system_reset_hook(self): pass
     def update(self, *args, **kwargs): pass

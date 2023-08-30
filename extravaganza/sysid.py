@@ -15,7 +15,7 @@ from extravaganza.controllers import Controller
 from extravaganza.observables import Trajectory
 from extravaganza.models import TorchMLP, TorchLifter
 from extravaganza.stats import Stats
-from extravaganza.utils import set_seed, jkey, sample, get_classname, least_squares, method_of_moments, summarize_lds, opnorm
+from extravaganza.utils import set_seed, jkey, sample, get_classname, least_squares, method_of_moments, summarize_lds, opnorm, dare_gain
 
 KOOPMAN_METHODS = ['polynomial', 'rbf', 'fourier']
 MAX_OPNORM = None  # set this to `None` to have unconstrained opnorm of `A` in our regressions
@@ -26,6 +26,7 @@ LOSS_WEIGHTS = {
     'jac': 0,
     'dot': 0,
     'vmf': 0,
+    'dare': 0,
     'jac_conditioning': 0,
     'l2 linearization': 1,
     'l2 linearization relative': 0,
@@ -34,13 +35,13 @@ LOSS_WEIGHTS = {
     'injectivity': 0,
     'surjectivity': 0,
     'cpc': 0,
-    'guess the control': 0,
+    'guess the control': 1,
     'simplification': 1,
     'residual centeredness': 0,
     'centeredness': 0,
     
     # dont touch these
-    'consistency': 0.1,
+    'consistency': 0,
     'proj_isometry': 1,
     'proj_error': 1,
 }
@@ -318,6 +319,7 @@ class Lifter(SystemModel):
         ignore_idxs = np.cumsum(traj_lens) - 1  # -1 to capture last idxs of old trajs, not first idxs of new trajs
         mask = np.ones(states.shape[0], dtype=bool)
         for idx in ignore_idxs: mask[max(0, idx - self.hh + 1): idx + self.hh + 1] = False  # anything within +/- hh of a reset must go
+        # mask = np.logical_and(mask, ~np.isnan(costs))
         mask[:self.hh] = False  # the first hh must go
         mask = mask[:-1]
         
@@ -375,15 +377,21 @@ class Lifter(SystemModel):
             X, U, F, MASK = x, u, f, mask
             if self.batch_size > 0: assert self.batch_size < X.shape[0]
             
-            # # initialize our encoder to be the identity embedding
-            # C = torch.zeros(self.state_dim, self.obs_dim)
-            # for i in range(min(self.state_dim, self.obs_dim)): C[i, i] = 1.
-            # for _ in range(2000):
-            #     self.lifter_opt.zero_grad()
-            #     z, _ = self.lifter.encode(x, f)
-            #     loss = torch.nn.functional.mse_loss(z, (C @ x.unsqueeze(-1)).squeeze(-1))
-            #     loss.backward()
-            #     self.lifter_opt.step()
+            # initialize our encoder to be the identity embedding
+            C = torch.zeros(self.state_dim, self.obs_dim)
+            for i in range(min(self.state_dim, self.obs_dim)): C[i, i] = 1.
+            for _ in range(1000):
+                self.lifter_opt.zero_grad()
+                z, _ = self.lifter.encode(x[:-1], f[:-1])
+                loss = torch.nn.functional.mse_loss(z[mask], (C @ x[:-1][mask].unsqueeze(-1)).squeeze(-1))
+                loss.backward()
+                self.lifter_opt.step()
+            with torch.no_grad():
+                _, latent = self.lifter.encode(x, f)
+                A, B = least_squares(latent, u, mask)
+                if hasattr(self.lifter, 'A'):
+                    self.lifter.A.data = A
+                    self.lifter.B.data = B
                 
             # ----------------------------
             # TRAIN LOOP
@@ -419,7 +427,7 @@ class Lifter(SystemModel):
                         _z = (A @ _z.unsqueeze(-1) + B @ u[l:r].unsqueeze(-1)).squeeze(-1)
                         if l2: 
                             if LOSS_WEIGHTS['l2 linearization']: losses[f'l2 linearization {i}'] = torch.nn.functional.mse_loss(_z[_m], z[l+1:r+1][_m])
-                            if LOSS_WEIGHTS['l2 linearization relative']: losses[f'l2 linearization relative {i}'] = torch.mean((torch.norm(_z[_m] - z[l+1:r+1][_m], dim=-1) ** 2) / (torch.norm(z[l+1:r+1][_m], dim=-1) ** 2))
+                            if LOSS_WEIGHTS['l2 linearization relative']: losses[f'l2 linearization relative {i}'] = torch.mean((torch.norm(_z[_m] - z[l+1:r+1][_m], dim=-1) ** 2) / torch.norm(z[l+1:r+1][_m], dim=-1))
                         if l1: losses[f'l1 linearization {i}'] = torch.nn.functional.l1_loss(_z[_m], z[l+1:r+1][_m])
                         if simp: losses[f'simplification {i}'] = torch.nn.functional.mse_loss(torch.norm(_z[_m], dim=-1) ** 2, f[l+1:r+1][_m])
                 
@@ -467,6 +475,18 @@ class Lifter(SystemModel):
                     # _loss = torch.abs(torch.mean(torch.triu(_z.T @ _z, diagonal=1)))
                     # losses['surjectivity'] = _loss # 2 * torch.triu(torch.abs(gram), diagonal=1).sum() / (_n ** 2 - _n) #(obs_sq_dists[_mask] / (emb_sq_dists[_mask] + 1e-3 * threshold)).mean() if _mask.sum() > 0 else torch.tensor(0.)
                     
+                if LOSS_WEIGHTS['dare']:  # we want dare controls to be close to what we played iff cost decreased0
+                    try:
+                        K = dare_gain(A, B)
+                        dare_controls = (-K @ zprev.unsqueeze(-1)).squeeze(-1)
+                        _d, _u = dare_controls, u[:-1]
+                        dots = (_d * _u).sum(dim=-1)
+                        cost_diffs = f[1:] - f[:-1]
+                        loss = (cost_diffs[mask] * dots[mask]).mean()  # where cost_diffs is very negative, we want controls to be aligned. where cost_diffs is very positive, we want controls to be antialigned. if costs didnt change, no info
+                        losses['dare'] = loss + torch.norm(dare_controls[mask].mean(dim=0)) ** 2
+                    except:
+                        pass
+                    
                 if LOSS_WEIGHTS['isometry']:  # check the overleaf for this one boss :)
                     diffs = zgt - zprev
                     bus = (B @ u[:-1].unsqueeze(-1)).squeeze(-1)
@@ -492,7 +512,7 @@ class Lifter(SystemModel):
                     
                 # centeredness
                 if LOSS_WEIGHTS['residual centeredness']: losses['residual centeredness'] = torch.norm((zhat - zgt).mean(dim=0)) ** 2  # sq norm of mean residual
-                if LOSS_WEIGHTS['centeredness']: losses['centeredness'] = torch.norm(z.mean(dim=0)) ** 2 / (torch.norm(z, dim=-1) ** 2).mean()  # sq norm of mean embedding
+                if LOSS_WEIGHTS['centeredness']: losses['centeredness'] = torch.norm(z.mean(dim=0)) ** 2  # sq norm of mean embedding
                 
                 loss = 0.
                 for k, v in losses.items(): 
@@ -515,14 +535,14 @@ class Lifter(SystemModel):
                 self.AB['regression'] = least_squares(z, controls, max_opnorm=MAX_OPNORM)
                 self.AB['moments'] = method_of_moments(z, controls)
                 if hasattr(self.lifter, 'A'):
-                    _A, _B = torch.diag(self.lifter.A).detach().data.numpy(), self.lifter.B.detach().data.numpy() * self.sqrt_fmean
-                    # _A, _B = self.lifter.A.detach().data.numpy(), self.lifter.B.detach().data.numpy() * self.sqrt_fmean
+                    # _A, _B = torch.diag(self.lifter.A).detach().data.numpy(), self.lifter.B.detach().data.numpy() * self.sqrt_fmean
+                    _A, _B = self.lifter.A.detach().data.numpy(), self.lifter.B.detach().data.numpy() * self.sqrt_fmean
                     if self.lifter.latent_dim != self.lifter.state_dim:
                         _P = self.lifter.proj.detach().data.numpy()
                         _A, _B = _P @ _A @ np.linalg.pinv(_P), _P @ _B
                     self.AB['learned'] = _A, _B
                     logging.info('(LIFTER): fmean = {}'.format(fmean))
-                    ret = 'regression'
+                    ret = 'learned'
                 else:
                     ret = 'regression'
             

@@ -268,11 +268,11 @@ class TorchLifter(nn.Module):
         assert AB_method in ['learned', 'regression_nograd', 'regression', 'moments_nograd', 'moments']
         logging.info('(LIFTER): using "{}" method to get the AB matrices during each training step'.format(AB_method))
         if AB_method == 'learned':
-            self.A = torch.nn.Parameter(torch.ones(self.latent_dim, dtype=torch.float32, requires_grad=True))
-            # self.A = torch.nn.Parameter(torch.eye(self.latent_dim, dtype=torch.float32, requires_grad=True))
-            self.B = torch.nn.Parameter(torch.randn((self.latent_dim, u_dim), dtype=torch.float32, requires_grad=True)) * 1e-6
-            self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
-            # self.get_AB = lambda xs, us, mask: (self.A, self.B)
+            # self.A = torch.nn.Parameter(torch.ones(self.latent_dim, dtype=torch.float32, requires_grad=True))
+            self.A = torch.nn.Parameter(torch.eye(self.latent_dim, dtype=torch.float32, requires_grad=True))
+            self.B = torch.nn.Parameter(torch.randn((self.latent_dim, u_dim), dtype=torch.float32, requires_grad=True))
+            # self.get_AB = lambda xs, us, mask: (torch.diag(self.A), self.B)
+            self.get_AB = lambda xs, us, mask: (self.A, self.B)
         elif AB_method == 'regression_nograd':
             def get_AB(xs, us, mask):
                 with torch.no_grad(): return least_squares(xs, us, mask=mask)
@@ -374,10 +374,10 @@ class TorchLifter(nn.Module):
         if self.isometric: 
             assert torch.allclose(torch.norm(latent, dim=-1) ** 2, sq_norms), (torch.norm(latent, dim=-1) ** 2, sq_norms)
         if self.loss_weights['vmf']:  # VMF regularization
-            unit_vecs = latent / (torch.norm(latent, dim=-1).unsqueeze(-1) + 1e-6)
-            unit_vecs = unit_vecs[sq_norms > 0.005]
+            v = latent[sq_norms > 0.01]  # grab vectors with above average norm
+            unit_vecs = v / (torch.norm(v, dim=-1).unsqueeze(-1) + 1e-6)
             p, Rbar = unit_vecs.shape[-1], torch.norm(unit_vecs.mean(dim=0))
-            kappa = Rbar * (p - Rbar ** 2) / (1 - Rbar ** 2) # get estimate of kappa from induced VMF distribution, see https://en.wikipedia.org/wiki/Von_Mises–Fisher_distribution
+            kappa = Rbar * (p - Rbar ** 2) / (1 - Rbar ** 2) # get MLE estimate of kappa from induced VMF distribution, see https://en.wikipedia.org/wiki/Von_Mises–Fisher_distribution
             kl = kappa - (p // 2 - 1) * np.log(2) # kl divergence between this VMF distribution and the uniform, see Corollary 3.2 from https://arxiv.org/pdf/1502.07104.pdf
             losses['vmf'] = kl
         
