@@ -20,7 +20,9 @@ import gymnasium as gym
 from extravaganza.controllers import PID, PPO
 from extravaganza.models import TorchMLP, TorchCNN
 from extravaganza.stats import Stats
-from extravaganza.utils import device, set_seed, jkey, get_classname, ContinuousCartPoleEnv, random_lds
+from extravaganza.utils import device, set_seed, jkey, get_classname, ContinuousCartPoleEnv, random_lds, count_layers
+
+USE_WEIGHT_NORMS_FOR_NN = False
                 
 class DynamicalSystem:
     reset_hook: Callable = lambda self: None
@@ -30,7 +32,6 @@ class DynamicalSystem:
         # needs to set the following things
         set_seed(seed)  # for reproducibility
         self.stats = stats
-        self.OBSERVABLE: bool = None
         raise NotImplementedError()
     
     @abstractmethod
@@ -68,6 +69,8 @@ class NNTraining(DynamicalSystem):
     repeat: int = 1
     t: int = 0
     episode_t: int = 1
+    
+    state_dim: int = -1
         
     def reset(self, seed: int = None):
         """
@@ -77,13 +80,15 @@ class NNTraining(DynamicalSystem):
         for layer in self.model.modules():
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-                # try:
-                #     torch.nn.init.xavier_uniform_(layer.weight)
-                #     if hasattr(self.model, 'use_bias') and self.model.use_bias:
-                #         torch.nn.init.xavier_uniform_(layer.bias)
-                # except: pass
+            else: assert not isinstance(layer, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d))
+            # try:
+            #     torch.nn.init.kaiming_normal_(layer.weight)
+            #     if hasattr(self.model, 'use_bias') and self.model.use_bias:
+            #         torch.nn.init.kaiming_normal_(layer.bias)
+            # except: pass
         self.model.train()  
         self.opt.__setstate__({'state': defaultdict(dict)})  
+        self.dl = iter(self.train_dl)
         
         if 'train losses' not in self.stats._stats: self.stats.register('train losses', obj_class=float)
         if 'val losses' not in self.stats._stats: self.stats.register('val losses', obj_class=float)
@@ -98,11 +103,79 @@ class NNTraining(DynamicalSystem):
         self.reset_hook()
         return self
     
+    def _get_state(self):  # must be called after loss.backward() and before opt.zero_grad()!!
+        with torch.no_grad():
+            if USE_WEIGHT_NORMS_FOR_NN: param_sq_norms = []  # these lists are layerwise
+            grad_sq_norms = []
+            for layer in self.model.modules():
+                if isinstance(layer, (torch.nn.Linear, torch.nn.Conv2d)):
+                    if USE_WEIGHT_NORMS_FOR_NN: p = torch.norm(layer.weight.data.reshape(-1)) ** 2
+                    assert layer.weight.grad is not None
+                    g = torch.norm(layer.weight.grad.data.reshape(-1)) ** 2
+                    if layer.bias is not None:
+                        if USE_WEIGHT_NORMS_FOR_NN: p = p + torch.norm(layer.bias.data.reshape(-1)) ** 2
+                        assert layer.bias.grad is not None
+                        g = g + torch.norm(layer.bias.grad.data.reshape(-1)) ** 2
+                    if USE_WEIGHT_NORMS_FOR_NN: param_sq_norms.append(p.item())
+                    grad_sq_norms.append(g.item())
+        if USE_WEIGHT_NORMS_FOR_NN: ret = jnp.array([*param_sq_norms, *grad_sq_norms])
+        else: ret = jnp.array(grad_sq_norms)
+        assert ret.shape == (self.state_dim,), (ret.shape, self.state_dim)
+        return jnp.clip(ret, -5, 5)
+    
+    def _dontdiverge(self, tloss, print=True):
+        
+        if tloss > self.threshold:
+            if print: logging.info('(NN): proc\'d `dontdiverge` on step t={} with loss={}, above the threshold of {}. had to reset'.format(self.t, tloss, self.threshold))
+            self.reset()
+            
+            # take a couple steps with tiny LR to see if this reset did ok
+            o = torch.optim.SGD(self.model.parameters(), lr=0.01)
+            for _ in range(5):
+                try: 
+                    x, y = next(self.dl)
+                except StopIteration: 
+                    self.dl = iter(self.train_dl)
+                    x, y = next(self.dl)
+                x = x.to(device); y = y.to(device)
+                o.zero_grad()
+                tloss = self.loss_fn(self.model(x), y)
+                tloss.backward()
+                o.step()
+            del o
+            self._dontdiverge(tloss, print=False)
+        
+        # if tloss > self.threshold:
+        #     if print: logging.info('(NN): proc\'d `dontdiverge` on step t={} with loss={}, above the threshold of {}'.format(self.t, tloss, self.threshold))
+        #     # take a couple steps with tiny LR to fix things otherwise this boy may diverge (only after resets, it must be a bug idk)
+        #     o = torch.optim.SGD(self.model.parameters(), lr=0.1)
+        #     for _ in range(20):
+        #         try: 
+        #             x, y = next(self.dl)
+        #         except StopIteration: 
+        #             self.dl = iter(self.train_dl)
+        #             x, y = next(self.dl)
+        #         x = x.to(device); y = y.to(device)
+        #         o.zero_grad()
+        #         tloss = self.loss_fn(self.model(x), y)
+        #         tloss.backward()
+        #         o.step()
+        #     del o
+            
+        #     if tloss > self.threshold: # if its still bad reset and try again
+        #         self.reset()
+        #         self._dontdiverge(tloss, print=False)  # so only outermost call prints
+        #     if print: logging.info('(NN): finished `dontdiverge` with tloss={} and {} to reset'.format(tloss.item(), 'HAD' if tloss > self.threshold else 'didnt have'))
+        pass
+    
     def interact(self, control: jnp.ndarray) -> Tuple[float, jnp.ndarray]:
+        assert self.state_dim > 0, 'forgot to set state dim in the constructor for {}!'.format(self.__class__)
+        
         # apply control
         self.apply_control(control, self)
         
         tloss = 0.
+        state = 0.
         for _ in range(self.repeat):
             # train step (observe costs)
             try: 
@@ -116,7 +189,10 @@ class NNTraining(DynamicalSystem):
             train_loss.backward()
             self.opt.step()
             tloss += train_loss.item()
+            state = state + self._get_state()
+            # self._dontdiverge(train_loss)  # safety measure to ensure things dont diverge. this doesnt really affect training but fixes a bug
         tloss /= self.repeat
+        state = state / self.repeat
         
         # update stats
         self.episode_trainlosses.append(tloss)
@@ -146,7 +222,7 @@ class NNTraining(DynamicalSystem):
         self.t += 1
         self.episode_t += 1
 
-        return tloss, None
+        return tloss, state
 
 class LinearRegression(NNTraining):
     """
@@ -163,7 +239,6 @@ class LinearRegression(NNTraining):
                  stats: Stats = None):
         
         set_seed(seed)  # for reproducibility
-        self.OBSERVABLE = False
 
         # data
         assert dataset in ['california', 'diabetes', 'generated']
@@ -186,6 +261,7 @@ class LinearRegression(NNTraining):
         
         # model
         model = torch.nn.Linear(train_x.shape[1], 1).float()
+        state_dim = 2 * count_layers(model) if USE_WEIGHT_NORMS_FOR_NN else count_layers(model)
         opt = make_optimizer(model)
         model.train().to(device)
         
@@ -200,7 +276,8 @@ class LinearRegression(NNTraining):
         super().__init__(stats=stats, model=model, opt=opt, apply_control=apply_control, 
                                          train_dl=train_dl, val_dl=val_dl, dl=dl,
                                          loss_fn=loss_fn, eval_fn=eval_fn, 
-                                         repeat=repeat, eval_every=eval_every)
+                                         repeat=repeat, eval_every=eval_every, state_dim=state_dim)
+        self.threshold = 100
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass
         
@@ -220,34 +297,36 @@ class MNIST(NNTraining):
                  stats: Stats = None):
         
         set_seed(seed)  # for reproducibility
-        self.OBSERVABLE = False
 
         # data
-        train_dl = DataLoader(
-            torchvision.datasets.MNIST('.data', train=True, download=True,
+        ds = torchvision.datasets.MNIST('.data', train=True, download=True,
                            transform=torchvision.transforms.Compose([
                                torchvision.transforms.ToTensor(),
                                torchvision.transforms.Normalize((0.1307,), (0.3081,))
-                           ])),
-            batch_size=batch_size, shuffle=True, drop_last=True)
-        val_dl = DataLoader(
-            torchvision.datasets.MNIST('./data', train=False, download=True,
+                           ]))
+        train_X, train_Y = next(iter(DataLoader(ds, batch_size=len(ds), shuffle=False, drop_last=False)))
+        train_dl = DataLoader(TensorDataset(train_X, train_Y), batch_size=batch_size if batch_size > 0 else len(ds), shuffle=True, drop_last=True)
+        
+        ds = torchvision.datasets.MNIST('./data', train=False, download=True,
                            transform=torchvision.transforms.Compose([
                                torchvision.transforms.ToTensor(),
                                torchvision.transforms.Normalize((0.1307,), (0.3081,))
-                           ])),
-            batch_size=batch_size, shuffle=False, drop_last=True)
+                           ]))
+        val_X, val_Y = next(iter(DataLoader(ds, batch_size=len(ds), shuffle=False, drop_last=False)))
+        val_dl = DataLoader(TensorDataset(val_X, val_Y), batch_size=batch_size if batch_size > 0 else len(ds), shuffle=False, drop_last=True)
         dl = iter(train_dl)
+        logging.info('(MNIST): loaded MNIST dataset! we will {} be validating'.format('NOT' if eval_every is None else ''))
         
         # model
         assert model_type in ['MLP', 'CNN']
         if model_type == 'MLP': model = TorchMLP(layer_dims=[int(28 * 28), 100, 100, 10]).float()
         elif model_type == 'CNN': model = TorchCNN(input_shape=(28, 28), output_dim=10)
+        state_dim = 2 * count_layers(model) if USE_WEIGHT_NORMS_FOR_NN else count_layers(model)
         opt = make_optimizer(model)
         model.train().to(device)  
         
         # losses
-        loss_fn = eval_fn = lambda yhat, y:  torch.nn.functional.nll_loss(yhat.softmax(dim=-1).log(), y)
+        loss_fn = eval_fn = lambda yhat, y:  torch.nn.functional.cross_entropy(yhat, y)
 
         # stats
         if stats is None:
@@ -257,8 +336,8 @@ class MNIST(NNTraining):
         super().__init__(stats=stats, model=model, opt=opt, apply_control=apply_control, 
                                          train_dl=train_dl, val_dl=val_dl, dl=dl,
                                          loss_fn=loss_fn, eval_fn=eval_fn, 
-                                         repeat=repeat, eval_every=eval_every)
-        
+                                         repeat=repeat, eval_every=eval_every, state_dim=state_dim)
+        self.threshold = 4
         self.reset(seed)  # sets random state for the beginning of the episode (in case it's changed during __init__)
         pass    
     

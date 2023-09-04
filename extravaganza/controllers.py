@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from extravaganza.stats import Stats
 from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname, dare_gain
 
-BETA = 1e6  # norm clipping for both the controller matrices and their grads
+BETA = 1e2  # norm clipping for both the controller matrices and their grads
 
 def clip(x: jnp.ndarray, name: str = None, beta: float = BETA):
     norm = jnp.linalg.norm(x)  
@@ -67,6 +67,7 @@ class EvanBPC(Controller):
                  method = 'REINFORCE',
                  use_tanh = False,
                  decay_scales = False,
+                 smoothing: int = 1,
                  use_stabilizing_K: bool = False,
                  seed: int = None,
                  stats: Stats = None):
@@ -114,7 +115,7 @@ class EvanBPC(Controller):
         
         # histories are rightmost recent (increasing in time)
         self.costs = deque(maxlen=2 * self.h)
-        self.prev_control = jnp.zeros(self.control_dim)
+        self.control_history = jnp.zeros((smoothing, self.control_dim))
         self.disturbance_history = jnp.zeros((2 * self.h, self.state_dim))  # past 2h disturbances, for controller
         self.state_history = jnp.zeros((2 * self.h, self.state_dim))
         self.t = 1
@@ -170,10 +171,13 @@ class EvanBPC(Controller):
     
     def system_reset_hook(self):
         self.reset_t = self.t
+        self.grads = deque([(jnp.zeros_like(self.M), jnp.zeros_like(self.M0), jnp.zeros_like(self.K))], maxlen=self.h)
         return super().system_reset_hook()
     
     def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
         assert state.shape == (self.state_dim,)
+        
+        if self.reset_t > 0: return self.control_history[-1]
         
         M_scale, M0_scale, K_scale = map(lambda s: s / (self.t ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
@@ -206,7 +210,10 @@ class EvanBPC(Controller):
         self.stats.update('-K @ state', (-self.K @ state).reshape(self.control_dim), t=self.t)
         self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
         self.stats.update('M0', self.M0, t=self.t)
-        return jnp.clip(control, -1e8, 1e8)
+        
+        # apply smoothing
+        self.control_history = append(self.control_history, control)
+        return jnp.mean(self.control_history, axis=0)
     
     
     def update(self, state: jnp.ndarray, cost: float, control: jnp.ndarray, next_state: jnp.ndarray, next_cost: float):
@@ -221,7 +228,7 @@ class EvanBPC(Controller):
         self.disturbance_history = append(self.disturbance_history, disturbance)
         
         if self.reset_t > 0: 
-            if self.t - self.reset_t <= self.h + 1: return  # don't update controller for `h` steps after resets
+            if self.t - self.reset_t <= 2 * self.h + 1: return  # don't update controller for `2h` steps after resets
             else: self.reset_t = -1 
         
         # 2. compute change in cost for zero order optimization
@@ -232,13 +239,13 @@ class EvanBPC(Controller):
         grad_M = self.grad_M(cost_diff) * d.reshape(1, -1, 1)
         grad_M0 = self.grad_M0(cost_diff) * d.reshape(-1)
         grad_K = self.grad_K(cost_diff) * d.reshape(-1, 1)
-        grad_M, grad_M0, grad_K = map(lambda arr: clip(arr), (grad_M, grad_M0, grad_K))  # use updates starting from h steps ago via popping left
+        grad_M, grad_M0, grad_K = map(lambda arr: clip(arr), (grad_M, grad_M0, grad_K))  # clip grads
         self.grads.append((grad_M, grad_M0, grad_K))
         if len(self.grads) == self.grads.maxlen:
             grad_M, grad_M0, grad_K = self.grads.popleft()  # use updates starting from h steps ago via popping left
-            self.M -= self.M_update_rescaler.step(grad_M, iterate=self.M)
+            self.M += self.M_update_rescaler.step(grad_M, iterate=self.M)
             self.M0 -= self.M0_update_rescaler.step(grad_M0, iterate=self.M0)
-            self.K -= self.K_update_rescaler.step(grad_K, iterate=self.K)  # note that this is minus since  u = -K @ x + ...
+            self.K += self.K_update_rescaler.step(grad_K, iterate=self.K)
             
         # 4. ensure norms are good
         self.M = clip(self.M, 'M')

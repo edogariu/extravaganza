@@ -97,7 +97,7 @@ class Experiment:
             
             # make system and controller
             system = make_system()
-            if not system.OBSERVABLE: assert isinstance(observable, TimeDelayedObservation), observable.__class__
+            # if not system.OBSERVABLE: assert isinstance(observable, TimeDelayedObservation), observable.__class__
             controller = make_controller(system)
             system.reset_hook = controller.system_reset_hook
             
@@ -185,11 +185,11 @@ class Experiment:
                     pbar.set_postfix(postfix)
                 
                 if (isinstance(state, jnp.ndarray) and jnp.any(jnp.isnan(state))) or (cost > 1e20):
-                    logging.error('(EXPERIMENT): state {} or cost {} diverged'.format(state, cost))
+                    logging.error('(EXPERIMENT): state {} or cost {} diverged at step {}'.format(state, cost, t))
                     if append_list is not None: 
                         with counter.get_lock():
                             counter.value += 1
-                    return None
+                    break
                 
             stats = Stats.concatenate((system.stats, controller.stats, stats))
             if append_list is not None: 
@@ -205,7 +205,7 @@ class Experiment:
             if append_list is not None: 
                 with counter.get_lock():
                         counter.value += 1
-            return None
+            pass
         
         return stats
 

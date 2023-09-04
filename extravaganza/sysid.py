@@ -24,9 +24,10 @@ LOSS_WEIGHTS = {
     'isometry': 0,
     'nontrivial': 1e-3,
     'jac': 0,
-    'dot': 0,
+    'dot': 1,
     'vmf': 0,
     'dare': 0,
+    'dare norms': 0,
     'jac_conditioning': 0,
     'l2 linearization': 1,
     'l2 linearization relative': 0,
@@ -35,20 +36,20 @@ LOSS_WEIGHTS = {
     'injectivity': 0,
     'surjectivity': 0,
     'cpc': 0,
-    'guess the control': 1,
+    'guess the control': 0,
     'simplification': 1,
     'residual centeredness': 0,
-    'centeredness': 0,
+    'centeredness': 0.1,
     
     # dont touch these
     'consistency': 0,
     'proj_isometry': 1,
     'proj_error': 1,
 }
-GET_LATENT_DIM = lambda state_dim: state_dim
+GET_LATENT_DIM = lambda state_dim: 2 * state_dim + 1
 RESCALE_AFTER_TRAINING = False
 
-GEN_LENGTH = 5000
+GEN_LENGTH = 10000
 DO_RESET_MASK_DEBUG = False  # to confirm whether the reset masks are correct. can only be used with CartPole
 
 class Explorer:
@@ -82,14 +83,18 @@ class Explorer:
         
         def generate_exploration_controls(length: int):
             logging.info('(EXPLORER) generating exploration control sequences using {} w.p. {}'.format(keys, jax.nn.softmax(probs)))
-            controls = []
-            pbar = tqdm.tqdm(total=length)
-            while len(controls) < length: 
-                seq = sample_single_sequence()
-                controls.extend(seq)
-                pbar.update(len(seq))
-            pbar.close(); del pbar
-            controls = controls[:length]
+            
+            if len(keys) == 1 and 'random' in keys:
+                controls = self._sample_random(args['random'], length)
+            else:
+                controls = []
+                pbar = tqdm.tqdm(total=length)
+                while len(controls) < length: 
+                    seq = sample_single_sequence()
+                    controls.extend(seq)
+                    pbar.update(len(seq))
+                pbar.close(); del pbar
+                controls = controls[:length]
             return controls
         self.GEN_LENGTH = GEN_LENGTH
         self.generate_exploration_controls = generate_exploration_controls
@@ -121,12 +126,18 @@ class Explorer:
         args['scales'], args['bounds'] = scales, bounds
         return args
 
-    def _sample_random(self, args: Dict):
+    def _sample_random(self, args: Dict, num = None):
         scales, bounds = args['scales'], args['bounds']
-        control = scales * sample(jkey(), shape=(self.control_dim,)) + self.initial_control
-        if bounds is not None: 
-            for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *bounds[i]))
-        return [control]
+        if num is None:
+            control = scales * sample(jkey(), shape=(self.control_dim,)) + self.initial_control
+            if bounds is not None: 
+                for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *bounds[i]))
+            return [control]
+        else:
+            control = scales * sample(jkey(), shape=(num, self.control_dim,)) + self.initial_control
+            if bounds is not None: 
+                for i in range(self.control_dim): control = control.at[:, i].set(jnp.clip(control[:, i], *bounds[i]))
+            return control
     
     def _prep_repeat(self, args: Dict):
         args = self._prep_random(args)
@@ -380,7 +391,7 @@ class Lifter(SystemModel):
             # initialize our encoder to be the identity embedding
             C = torch.zeros(self.state_dim, self.obs_dim)
             for i in range(min(self.state_dim, self.obs_dim)): C[i, i] = 1.
-            for _ in range(1000):
+            for _ in range(500):
                 self.lifter_opt.zero_grad()
                 z, _ = self.lifter.encode(x[:-1], f[:-1])
                 loss = torch.nn.functional.mse_loss(z[mask], (C @ x[:-1][mask].unsqueeze(-1)).squeeze(-1))
@@ -429,7 +440,7 @@ class Lifter(SystemModel):
                             if LOSS_WEIGHTS['l2 linearization']: losses[f'l2 linearization {i}'] = torch.nn.functional.mse_loss(_z[_m], z[l+1:r+1][_m])
                             if LOSS_WEIGHTS['l2 linearization relative']: losses[f'l2 linearization relative {i}'] = torch.mean((torch.norm(_z[_m] - z[l+1:r+1][_m], dim=-1) ** 2) / torch.norm(z[l+1:r+1][_m], dim=-1))
                         if l1: losses[f'l1 linearization {i}'] = torch.nn.functional.l1_loss(_z[_m], z[l+1:r+1][_m])
-                        if simp: losses[f'simplification {i}'] = torch.nn.functional.mse_loss(torch.norm(_z[_m], dim=-1) ** 2, f[l+1:r+1][_m])
+                        # if simp: losses[f'simplification {i}'] = torch.nn.functional.mse_loss(torch.norm(_z[_m], dim=-1) ** 2, f[l+1:r+1][_m])
                 
                 if LOSS_WEIGHTS['dot']:  # compares empirical expectation to the theoretical one
                     diffs = (zgt - zprev)[mask]
@@ -483,7 +494,8 @@ class Lifter(SystemModel):
                         dots = (_d * _u).sum(dim=-1)
                         cost_diffs = f[1:] - f[:-1]
                         loss = (cost_diffs[mask] * dots[mask]).mean()  # where cost_diffs is very negative, we want controls to be aligned. where cost_diffs is very positive, we want controls to be antialigned. if costs didnt change, no info
-                        losses['dare'] = loss + torch.norm(dare_controls[mask].mean(dim=0)) ** 2
+                        losses['dare'] = loss
+                        losses['dare norms'] = torch.norm(dare_controls[mask].mean(dim=0)) ** 2
                     except:
                         pass
                     

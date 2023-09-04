@@ -782,3 +782,10 @@ def random_lds(
         C = np.squeeze(C * [(mask < 0.75) != 0])
 
     return (A, B, C) if obs_dim is not None else (A, B)
+
+def count_layers(model: torch.nn.Module):  # counts number of linear or convolutional layers in a model
+    n = 0
+    for l in model.modules():
+        if isinstance(l, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)): n += 1
+    return n
+    

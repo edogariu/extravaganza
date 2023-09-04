@@ -18,6 +18,7 @@ Stat = namedtuple('Stat', ['ts',
                            'plottable'])
 
 class Stats(MutableMapping):  # maps keys to the corresponding stats!
+    
     """
     to represent statistics of an ongoing system. 
     """
@@ -183,10 +184,10 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             ax.plot(ts, means, fmt, label=label, color=color)
             ax.fill_between(ts, means - STD_CONFIDENCE * stds, means + STD_CONFIDENCE * stds, alpha=0.4, facecolor=color)
         else:
-            ts, vals = stat.ts, stat.values
-            if plot_idx is not None: vals = [v[plot_idx] for v in vals]
-            elif plot_norm: vals = [jnp.linalg.norm(v).item() for v in vals]
-            if plot_cummean: vals = jnp.cumsum(jnp.array(vals)) / jnp.arange(1, len(vals) + 1)
+            ts, vals = stat.ts, np.array(stat.values)
+            if plot_idx is not None: vals = vals[:, plot_idx]
+            elif plot_norm: vals = np.linalg.norm(vals, dim=-1)
+            if plot_cummean: vals = np.cumsum(vals) / np.arange(1, len(vals) + 1)
             ax.plot(stat.ts, vals, fmt, label=label, color=color)
         
         ax.set_xlabel('timestep (t)')
