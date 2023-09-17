@@ -3,15 +3,16 @@ from abc import abstractmethod
 from typing import Tuple
 from collections import deque
 
+import numpy as np
 import jax.numpy as jnp
 
 from extravaganza.stats import Stats
-from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, jkey, opnorm, get_classname, dare_gain
+from extravaganza.utils import rescale, d_rescale, inv_rescale, append, sample, set_seed, opnorm, get_classname, dare_gain
 
 BETA = 1e2  # norm clipping for both the controller matrices and their grads
 
-def clip(x: jnp.ndarray, name: str = None, beta: float = BETA):
-    norm = jnp.linalg.norm(x)  
+def clip(x: np.ndarray, name: str = None, beta: float = BETA):
+    norm = np.linalg.norm(x)  
     if norm > beta:
         if name is not None: logging.info('(CONTROLLER): clipped {}!'.format(name))
         x /= (norm / beta)
@@ -27,16 +28,16 @@ class Controller:
     stats: Stats = None
     
     @abstractmethod
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         """
         gets the next control as a function of the cost and arrived-in observation from playing the previous control (and possibly the disturbance given by the arrived-in observation)
         """
         pass
                            
     def update(self, 
-               state: jnp.ndarray, cost: float,   # state we were in 
-               control: jnp.ndarray,  # control we played
-               next_state: jnp.ndarray, next_cost: float,  # state we landed in
+               state: np.ndarray, cost: float,   # state we were in 
+               control: np.ndarray,  # control we played
+               next_state: np.ndarray, next_cost: float,  # state we landed in
                ):
         """
         Function to update the controller, by default a no-op
@@ -57,10 +58,10 @@ class EvanBPC(Controller):
     If `bounds` is not `None`, it will automatically clip (or apply `tanh`) and rescale to the given bounds.
     """
     def __init__(self,
-                 A: jnp.ndarray,
-                 B: jnp.ndarray,
+                 A: np.ndarray,
+                 B: np.ndarray,
                  h: int,
-                 initial_u: jnp.ndarray,
+                 initial_u: np.ndarray,
                  rescalers,
                  initial_scales: Tuple[float, float, float],
                  bounds = None,
@@ -73,7 +74,7 @@ class EvanBPC(Controller):
                  stats: Stats = None):
 
         set_seed(seed)  # for reproducibility
-        
+
         # check things make sense
         self.state_dim, self.control_dim = B.shape
         
@@ -81,7 +82,7 @@ class EvanBPC(Controller):
         assert method in ['FKM', 'REINFORCE']
         assert all(map(lambda i: i >= 0, initial_scales))
         if bounds is not None:
-            bounds = jnp.array(bounds).reshape(-1, 2).T
+            bounds = np.array(bounds).reshape(-1, 2).T
             assert len(bounds[0]) == len(bounds[1]) and len(bounds[0]) == self.control_dim, 'improper bounds'
             assert all(map(lambda i: bounds[0, i] < bounds[1, i], range(self.control_dim))), 'improper bounds'
         
@@ -98,55 +99,55 @@ class EvanBPC(Controller):
         # for rescaling controls
         self.rescale_u = lambda u: rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else u
         self.inv_rescale_u = lambda ru: inv_rescale(ru, self.bounds, use_tanh=use_tanh) if self.bounds is not None else ru
-        self.d_rescale_u = lambda u: d_rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else jnp.ones_like(u)        
+        self.d_rescale_u = lambda u: d_rescale(u, self.bounds, use_tanh=use_tanh) if self.bounds is not None else np.ones_like(u)        
         
         # controller params
-        self.M = jnp.zeros((self.h, self.control_dim, self.state_dim))
+        self.M = np.zeros((self.h, self.control_dim, self.state_dim))
         self.M0 = self.inv_rescale_u(initial_u)
-        self.K = jnp.zeros((self.control_dim, self.state_dim))
+        self.K = np.zeros((self.control_dim, self.state_dim))
         if use_stabilizing_K:  # initialize state feedback controller as LQR solution to stabilize system
             K = dare_gain(self.A, self.B)
             oppy = opnorm(self.A - self.B @ K)
             if oppy < 10:
-                logging.info('(CONTROLLER): we WILL be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
+                # logging.info('(CONTROLLER): we WILL be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
                 self.K = K
             else: logging.warning('(CONTROLLER): we will NOT be using the stabilizing controller with ||A-BK||_op={}'.format(oppy))
         self.M_scale, self.M0_scale, self.K_scale = initial_scales
         
         # histories are rightmost recent (increasing in time)
         self.costs = deque(maxlen=2 * self.h)
-        self.control_history = jnp.zeros((smoothing, self.control_dim))
-        self.disturbance_history = jnp.zeros((2 * self.h, self.state_dim))  # past 2h disturbances, for controller
-        self.state_history = jnp.zeros((2 * self.h, self.state_dim))
+        self.control_history = np.zeros((smoothing, self.control_dim))
+        self.disturbance_history = np.zeros((2 * self.h, self.state_dim))  # past 2h disturbances, for controller
+        self.state_history = np.zeros((2 * self.h, self.state_dim))
         self.t = 1
 
         # grad estimation stuff -- NOTE maybe `self.eps` should be divided by its variance?
         if self.method == 'FKM':
-            self.eps_M = jnp.zeros((self.h, self.h, self.control_dim, self.state_dim))  # noise history of M perturbations
-            self.eps_M0 = jnp.zeros((self.h, self.control_dim))  # noise history of M0 perturbations
-            self.eps_K = jnp.zeros((self.h, self.control_dim, self.state_dim))  # noise history of K perturbations
+            self.eps_M = np.zeros((self.h, self.h, self.control_dim, self.state_dim))  # noise history of M perturbations
+            self.eps_M0 = np.zeros((self.h, self.control_dim))  # noise history of M0 perturbations
+            self.eps_K = np.zeros((self.h, self.control_dim, self.state_dim))  # noise history of K perturbations
             
             def grad_M(diff):
-                return diff * jnp.sum(self.eps_M, axis=0) #* self.control_dim * self.state_dim * self.h
+                return diff * np.sum(self.eps_M, axis=0) #* self.control_dim * self.state_dim * self.h
             def grad_M0(diff):
-                return diff * jnp.sum(self.eps_M0, axis=0) #* self.control_dim * self.state_dim * self.h
+                return diff * np.sum(self.eps_M0, axis=0) #* self.control_dim * self.state_dim * self.h
             def grad_K(diff):
-                return diff * jnp.sum(self.eps_K, axis=0) #* self.control_dim * self.state_dim * self.h
+                return diff * np.sum(self.eps_K, axis=0) #* self.control_dim * self.state_dim * self.h
             
         elif self.method == 'REINFORCE':
-            self.eps = jnp.zeros((self.h + 1, self.control_dim))  # noise history of u perturbations
+            self.eps = np.zeros((self.h + 1, self.control_dim))  # noise history of u perturbations
             
-            def grad_M(diff) -> jnp.ndarray:
-                val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.disturbance_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)])
-                return diff * val #* self.control_dim * self.state_dim * self.h
-            def grad_M0(diff) -> jnp.ndarray:
-                return diff * self.eps[-1] #* self.control_dim * self.state_dim * self.h
-            def grad_K(diff) -> jnp.ndarray:
+            def grad_M(c) -> np.ndarray:
+                val = sum([np.transpose(np.einsum('ij,k->ijk', self.disturbance_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)])
+                return c * val #* self.control_dim * self.state_dim * self.h
+            def grad_M0(c) -> np.ndarray:
+                return c * self.eps[-1] #* self.control_dim * self.state_dim * self.h
+            def grad_K(c) -> np.ndarray:
                 # val = self.eps[-1].reshape(self.control_dim, 1) @ self.prev_state.reshape(1, self.state_dim)
-                val = sum([jnp.transpose(jnp.einsum('ij,k->ijk', self.state_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)]).sum(axis=0)
-                return -diff * val #* self.control_dim * self.state_dim * self.h
+                val = sum([np.transpose(np.einsum('ij,k->ijk', self.state_history[i: self.h + i], self.eps[i]), axes=(0, 2, 1)) for i in range(self.h)]).sum(axis=0)
+                return -c * val #* self.control_dim * self.state_dim * self.h
             
-        self.grads = deque([(jnp.zeros_like(self.M), jnp.zeros_like(self.M0), jnp.zeros_like(self.K))], maxlen=self.h)
+        self.grads = deque([(np.zeros_like(self.M), np.zeros_like(self.M0), np.zeros_like(self.K))], maxlen=self.h)
         self.grad_M = grad_M
         self.grad_M0 = grad_M0
         self.grad_K = grad_K
@@ -160,32 +161,34 @@ class EvanBPC(Controller):
             logging.debug('({}): no `Stats` object provided, so we will use the sysid states.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
-        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
-        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
-        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
-        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
+        self.stats.register('disturbances', obj_class=np.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=np.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=np.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=np.ndarray, shape=(self.control_dim,))
         pass
 
 # ------------------------------------------------------------------------------------------------------------
     
     def system_reset_hook(self):
         self.reset_t = self.t
-        self.grads = deque([(jnp.zeros_like(self.M), jnp.zeros_like(self.M0), jnp.zeros_like(self.K))], maxlen=self.h)
+        self.grads = deque([(np.zeros_like(self.M), np.zeros_like(self.M0), np.zeros_like(self.K))], maxlen=self.h)
         return super().system_reset_hook()
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,)
         
-        if self.reset_t > 0: return self.control_history[-1]
+        if self.reset_t > 0: 
+            return self.M0
+            # return self.control_history[-1]
         
         M_scale, M0_scale, K_scale = map(lambda s: s / (self.t ** 0.25) if self.decay_scales else s, [self.M_scale, self.M0_scale, self.K_scale])
         M_tilde, M0_tilde, K_tilde = self.M, self.M0, self.K
 
         if self.method == 'FKM':  # perturb em all
-            eps_M = sample(jkey(), (self.h, self.control_dim, self.state_dim), 'normal')
-            eps_M0 = sample(jkey(), (self.control_dim,), 'normal')
-            eps_K = sample(jkey(), (self.control_dim, self.state_dim), 'normal')
+            eps_M = sample((self.h, self.control_dim, self.state_dim), 'normal')
+            eps_M0 = sample((self.control_dim,), 'normal')
+            eps_K = sample((self.control_dim, self.state_dim), 'normal')
             M_tilde = M_tilde + M_scale * eps_M
             M0_tilde = M0_tilde + M0_scale * eps_M0
             K_tilde = K_tilde + K_scale * eps_K
@@ -194,42 +197,44 @@ class EvanBPC(Controller):
             if K_scale > 0: self.eps_K = append(self.eps_K, eps_K)
             
         elif self.method == 'REINFORCE':  # perturb output only
-            eps = sample(jkey(), (self.control_dim,), 'normal')
+            eps = sample((self.control_dim,), 'sphere')
             M0_tilde = M0_tilde + M0_scale * eps
             if M0_scale > 0: self.eps = append(self.eps, eps)
             
         # TODO this might not be the right thing to do with `K` when rescaling!!!!
-        control = -K_tilde @ state + M0_tilde + jnp.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))        
+        _k, _m0, _m = -K_tilde @ state, M0_tilde, np.tensordot(M_tilde, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))       
+        control =  _k + _m0 + _m
         control = self.rescale_u(control)
         if self.bounds is not None: 
-            for i in range(self.control_dim): control = control.at[i].set(jnp.clip(control[i], *self.bounds[:, i]))
-            # control = jnp.clip(control, *self.bounds)
+            for i in range(self.control_dim): control[i] = np.clip(control[i], *self.bounds[:, i])
         
         # update stats
         self.stats.update('states', state, t=self.t)
-        self.stats.update('-K @ state', (-self.K @ state).reshape(self.control_dim), t=self.t)
-        self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.disturbance_history[-self.h:], axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
-        self.stats.update('M0', self.M0, t=self.t)
+        self.stats.update('-K @ state', _k.reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', np.copy(self.M0).reshape(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', _m.reshape(self.control_dim), t=self.t)
         
         # apply smoothing
         self.control_history = append(self.control_history, control)
-        return jnp.mean(self.control_history, axis=0)
+        return np.mean(self.control_history, axis=0)
     
     
-    def update(self, state: jnp.ndarray, cost: float, control: jnp.ndarray, next_state: jnp.ndarray, next_cost: float):
+    def update(self, state: np.ndarray, cost: float, control: np.ndarray, next_state: np.ndarray, next_cost: float):
         assert state.shape == next_state.shape and state.shape == (self.state_dim,)
         assert control.shape == (self.control_dim,)
-                
+        
         self.t += 1
         
         # 1. observe state and disturbance
-        disturbance = next_state - (self.A @ state + self.B @ control) if self.reset_t == -1 else jnp.zeros(self.state_dim)
+        disturbance = next_state - (self.A @ state + self.B @ control) if self.reset_t == -1 else np.zeros(self.state_dim)
         self.state_history = append(self.state_history, next_state)
         self.disturbance_history = append(self.disturbance_history, disturbance)
         
         if self.reset_t > 0: 
             if self.t - self.reset_t <= 2 * self.h + 1: return  # don't update controller for `2h` steps after resets
             else: self.reset_t = -1 
+        
+        self.stats.update('disturbances', disturbance, t=self.t)
         
         # 2. compute change in cost for zero order optimization
         cost_diff = next_cost - cost
@@ -251,8 +256,6 @@ class EvanBPC(Controller):
         self.M = clip(self.M, 'M')
         self.K = clip(self.K, 'K')
         self.M0 = clip(self.M0, 'M0')
-            
-        self.stats.update('disturbances', disturbance, t=self.t)
         pass
         
     
@@ -266,18 +269,18 @@ from deluca.agents._bpc import BPC as _BPC
     
 def get_seed(kwargs):
     if 'seed' in kwargs:
-            seed = kwargs['seed']
-            del kwargs['seed']
+        seed = kwargs['seed']
+        del kwargs['seed']
     else:
         seed = None
     return seed
     
 class ConstantController(Controller):
-    def __init__(self, value: jnp.ndarray, state_dim: int, stats: Stats = None) -> None:
+    def __init__(self, value: np.ndarray, state_dim: int, stats: Stats = None) -> None:
         super().__init__()
         self.value = value
-        if not isinstance(self.value, jnp.ndarray):
-            self.value = jnp.array(self.value)
+        if not isinstance(self.value, np.ndarray):
+            self.value = np.array(self.value)
         self.control_dim = value.shape[0]
         self.state_dim = state_dim
         
@@ -286,10 +289,10 @@ class ConstantController(Controller):
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
         pass
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         self.stats.update('states', state, t=self.t)
         self.t += 1
         return self.value
@@ -303,27 +306,27 @@ class LQR(_LQR):
 
         self.stats = Stats()
         self.t = 0
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
-        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=np.ndarray, shape=(self.control_dim,))
         pass
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         self.t += 1
-        control = self(state)
+        control = np.array(self(state))
         self.stats.update('states', state, t=self.t)
         self.stats.update('-K @ state', control.reshape(self.control_dim), t=self.t)
         return control
     
+    def update(self, state: np.ndarray, cost: float, control: np.ndarray,  next_state: np.ndarray, next_cost: float): pass
     def system_reset_hook(self): pass
-    def update(self, *args, **kwargs): pass
     
 class HINF(Controller):
     def __init__(self, 
-                 A: jnp.ndarray,
-                 B: jnp.ndarray,
-                 Q: jnp.ndarray = None,
-                 R: jnp.ndarray = None,
+                 A: np.ndarray,
+                 B: np.ndarray,
+                 Q: np.ndarray = None,
+                 R: np.ndarray = None,
                  T: int = 100,
                  gamma: float = 10,
                  seed: int = None):
@@ -332,7 +335,7 @@ class HINF(Controller):
         dx, du = B.shape
         if Q is None: Q = jnp.identity(dx, dtype=jnp.float32)
         if R is None: R = jnp.identity(du, dtype=jnp.float32)
-        P, K = [jnp.zeros((dx, dx)) for _ in range(T + 1)], [jnp.zeros((du, dx)) for _ in range(T)], 
+        P, K = [np.zeros((dx, dx)) for _ in range(T + 1)], [np.zeros((du, dx)) for _ in range(T)], 
         P[T] = Q
         for t in range(T - 1, -1, -1):
             Lambda = jnp.eye(dx) + (B @ jnp.linalg.inv(R) @ B.T - gamma ** -2 * jnp.eye(dx)) @ P[t + 1]
@@ -341,15 +344,15 @@ class HINF(Controller):
         
         self.state_dim = dx
         self.control_dim = du
-        self.K = K
+        self.K = np.array(K)
         self.t = 0
         self.stats = Stats()
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
         pass
     
     def get_control(self, 
                     cost: float, 
-                    state: jnp.ndarray) -> jnp.ndarray:
+                    state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         ret = self.K[min(self.t, len(self.K) - 1)] @ state
         self.stats.update('states', state, t=self.t)
@@ -362,81 +365,83 @@ class GPC(_GPC):
         super().__init__(*args, **kwargs)
         self.control_dim, self.state_dim = self.K.shape
         self.stats = Stats()
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
         self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         
-        self.stats.update('states', self.state.reshape(self.state_dim), t=self.t)
+        self.stats.update('states', np.array(self.state).reshape(self.state_dim), t=self.t)
         self.stats.update('-K @ state', (-self.K @ self.state).reshape(self.control_dim), t=self.t)
         self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.last_h_noises(), axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
         self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
         self.stats.update('disturbances', self.noise_history[-1].reshape(self.state_dim), t=self.t)
         assert state.ndim == 1, state.shape
             
-        return self(state)
+        return np.array(self(state))
     
+    def update(self, state: np.ndarray, cost: float, control: np.ndarray,  next_state: np.ndarray, next_cost: float): pass
     def system_reset_hook(self): pass
-    def update(self, *args, **kwargs): pass
-
+    
 class BPC(_BPC):
     def __init__(self, *args, **kwargs):
         set_seed(get_seed(kwargs))
         super().__init__(*args, **kwargs)
         self.control_dim, self.state_dim = self.K.shape
         self.stats = Stats()
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
         self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
         self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
         pass
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
 
-        self.stats.update('states', self.state.reshape(self.state_dim), t=self.t)
+        self.stats.update('states', np.array(self.state).reshape(self.state_dim), t=self.t)
         self.stats.update('-K @ state', (-self.K @ self.state).reshape(self.control_dim), t=self.t)
         self.stats.update('M \cdot w', (jnp.tensordot(self.M, self.noise_history, axes=([0, 2], [0, 1]))).reshape(self.control_dim), t=self.t)
         self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
         self.stats.update('disturbances', self.noise_history[-1].reshape(self.state_dim), t=self.t)
             
-        return self(state.reshape(self.state_dim, 1), cost).reshape(self.control_dim)
+        return np.array(self(state.reshape(self.state_dim, 1), cost)).reshape(self.control_dim)
     
+    def update(self, state: np.ndarray, cost: float, control: np.ndarray,  next_state: np.ndarray, next_cost: float): pass
     def system_reset_hook(self): pass
-    def update(self, *args, **kwargs): pass
- 
+    
 class RBPC(Controller):  # from Udaya
     def __init__(self, A, B, Q=None, R=None, M=5, H=5, lr=0.01, delta=0.001, noise_sd=0.05, seed: int = None):
         set_seed(seed)
         n, m = B.shape
-        if Q is None: Q = jnp.eye(n)
-        if R is None: R = jnp.eye(m)
+        if Q is None: Q = np.eye(n)
+        if R is None: R = np.eye(m)
         self.n, self.m = n, m
         self.lr, self.A, self.B, self.M, self.H, self.noise_sd = lr, A, B, M, H, noise_sd
-        self.x, self.u, self.delta = jnp.zeros((n, 1)), jnp.zeros((m, 1)), delta
-        self.K, self.E, self.W = LQR(A, B, Q, R).K, jnp.zeros((M, n, m)), jnp.zeros((M + H -1, n))
-        self.eps = sample(jkey(), (self.M, self.m), 'sphere')
+        self.x, self.u, self.delta = np.zeros((n, 1)), np.zeros((m, 1)), delta
+        self.K, self.E, self.W = np.array(LQR(A, B, Q, R).K), np.zeros((M, n, m)), np.zeros((M + H -1, n))
+        # self.K = np.zeros_like(self.K); logging.info('(RBPC): not using LQR gain!!!')
+        self.eps = sample((self.M, self.m), 'sphere')
         self.cost = 0.
         self.control_dim, self.state_dim = self.K.shape
+        self.t = 0
         
         self.stats = Stats()
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(self.state_dim,))
-        self.stats.register('-K @ state', obj_class=jnp.ndarray, shape=(self.control_dim,))
-        self.stats.register('M \cdot w', obj_class=jnp.ndarray, shape=(self.control_dim,))
-        self.stats.register('M0', obj_class=jnp.ndarray, shape=(self.control_dim,))
-        self.stats.register('disturbances', obj_class=jnp.ndarray, shape=(self.state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(self.state_dim,))
+        self.stats.register('-K @ state', obj_class=np.ndarray, shape=(self.control_dim,))
+        self.stats.register('M \cdot w', obj_class=np.ndarray, shape=(self.control_dim,))
+        self.stats.register('M0', obj_class=np.ndarray, shape=(self.control_dim,))
+        self.stats.register('disturbances', obj_class=np.ndarray, shape=(self.state_dim,))
         pass
 
     def Egrad(self, cost):
-        gE = jnp.zeros((self.M, self.n, self.m))
+        gE = np.zeros((self.M, self.n, self.m))
         for i in range(self.H):
-          gE += jnp.einsum("ij, k->ijk",self.W[i:self.M+i,:], self.eps[i])
+          gE += np.einsum("ij, k->ijk",self.W[i:self.M+i,:], self.eps[i])
         return gE * cost
 
     def act(self, x, cost):
@@ -449,89 +454,94 @@ class RBPC(Controller):  # from Udaya
         # 2. Execute updates
         self.E -= self.lr * delta_E
 
-        # # 3. Ensure norm is good
-        # norm = jnp.linalg.norm(self.E)
-        # if norm > 1:
-        #    self.E *= 1/ norm
+        # 3. Ensure norm is good
+        norm = jnp.linalg.norm(self.E)
+        beta = 1e0
+        if norm > beta:
+           self.E *= beta / norm
 
         # 4. Get new noise
         w = x - self.A @ self.x - self.B @ self.u
         w = w.reshape(self.n)
-        self.W = self.W.at[0].set(w)
-        self.W = jnp.roll(self.W, -1, axis = 0)
+        w = np.clip(w, -10, 10)
+        # self.W = self.W.at[0].set(w)
+        self.W[0] = w
+        self.W = np.roll(self.W, -1, axis = 0)
             
         # 5. Get new eps (after parameter update (4) or ...?)
-        noise = sample(jkey(), (self.m,), 'sphere')
-        self.eps = self.eps.at[0].set(self.noise_sd * noise)
-        self.eps = jnp.roll(self.eps, -1, axis = 0)
+        noise = self.noise_sd * sample((self.m,), 'sphere')
+        self.eps[0] = noise
+        # self.eps = self.eps.at[0].set(self.noise_sd * noise)
+        self.eps = np.roll(self.eps, -1, axis = 0)
 
         # 5. Update x & t and get action
         self.x, self.t = x, self.t + 1
-        u = -self.K @ x + jnp.tensordot(self.E , self.W[-self.M:], axes = ([0, 1], [0, 1])).reshape((self.m, 1)) + self.eps[-1].reshape((self.m, 1))
+        u = -self.K @ x + np.tensordot(self.E , self.W[-self.M:], axes = ([0, 1], [0, 1])).reshape((self.m, 1)) + self.eps[-1].reshape((self.m, 1))
         self.u = u.reshape((self.m, 1))
               
         return self.u.reshape(self.m)
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         
         self.stats.update('states', self.x.reshape(self.state_dim), t=self.t)
         self.stats.update('-K @ state', (-self.K @ self.x).reshape(self.control_dim), t=self.t)
-        self.stats.update('M \cdot w', (jnp.tensordot(self.E, self.W[-self.M:], axes=([0, 1], [0, 1]))).reshape(self.control_dim), t=self.t)
-        self.stats.update('M0', jnp.zeros(self.control_dim), t=self.t)
+        self.stats.update('M \cdot w', (np.tensordot(self.E, self.W[-self.M:], axes=([0, 1], [0, 1]))).reshape(self.control_dim), t=self.t)
+        self.stats.update('M0', np.zeros(self.control_dim), t=self.t)
         self.stats.update('disturbances', self.W[-1].reshape(self.state_dim), t=self.t)
         
-        return self.act(state, cost)
+        self.t += 1
+        return np.array(self.act(state, cost))
     
 # ----------------------------------------------------------------------------------------
 
 class PID(Controller):
     def __init__(self, 
                  control_dim: int, 
-                 setpoint: jnp.ndarray,
-                 obs_mask: jnp.ndarray,
-                 Kp: jnp.ndarray = None, 
-                 Ki: jnp.ndarray = None, 
-                 Kd: jnp.ndarray = None, 
+                 setpoint: np.ndarray,
+                 obs_mask: np.ndarray,
+                 Kp: np.ndarray = None, 
+                 Ki: np.ndarray = None, 
+                 Kd: np.ndarray = None, 
                  stats: Stats = None):
         
         state_dim = int(sum(obs_mask))
         if isinstance(setpoint, float): setpoint = jnp.array([setpoint])
         assert setpoint.shape == (state_dim,)
-        self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, state_dim) if t is not None else jnp.zeros((control_dim, state_dim)), 
+        self.Kp, self.Ki, self.Kd = map(lambda t: jnp.array(t).reshape(control_dim, state_dim) if t is not None else np.zeros((control_dim, state_dim)), 
                                         [Kp, Ki, Kd])
         self.state_dim = state_dim
         self.control_dim = control_dim
         self.setpoint = setpoint
         self.obs_idxs = jnp.where(jnp.array(obs_mask) == 1)[0]
         
-        self.p = jnp.zeros(self.state_dim)  # keep track of current error
-        self.i = jnp.zeros(self.state_dim)  # keep track of accumulated error
+        self.p = np.zeros(self.state_dim)  # keep track of current error
+        self.i = np.zeros(self.state_dim)  # keep track of accumulated error
 
         self.t = 0
         if stats is None:
             logging.debug('({}): no `Stats` object provided, so a new one will be made.'.format(get_classname(self)))
             stats = Stats()
         self.stats = stats
-        self.stats.register('states', obj_class=jnp.ndarray, shape=(state_dim,))
-        self.stats.register('Kp', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
-        self.stats.register('Ki', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
-        self.stats.register('Kd', obj_class=jnp.ndarray, shape=(control_dim * state_dim,))
-        self.stats.register('P', obj_class=jnp.ndarray, shape=(state_dim,))
-        self.stats.register('I', obj_class=jnp.ndarray, shape=(state_dim,))
-        self.stats.register('D', obj_class=jnp.ndarray, shape=(state_dim,))
+        self.stats.register('states', obj_class=np.ndarray, shape=(state_dim,))
+        self.stats.register('Kp', obj_class=np.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('Ki', obj_class=np.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('Kd', obj_class=np.ndarray, shape=(control_dim * state_dim,))
+        self.stats.register('P', obj_class=np.ndarray, shape=(state_dim,))
+        self.stats.register('I', obj_class=np.ndarray, shape=(state_dim,))
+        self.stats.register('D', obj_class=np.ndarray, shape=(state_dim,))
         pass
     
     def reset(self, seed: int = None):
         set_seed(seed)  # for reproducibility
 
-        self.p = jnp.zeros(self.state_dim)
-        self.i = jnp.zeros(self.state_dim)
+        self.p = np.zeros(self.state_dim)
+        self.i = np.zeros(self.state_dim)
         return self
     
     def get_control(self, 
                     cost: float, 
-                    state: jnp.ndarray) -> jnp.ndarray:
+                    state: np.ndarray) -> np.ndarray:
         state = jnp.take(state, self.obs_idxs)
         assert state.shape == (self.state_dim,), (state.shape, self.state_dim)
         
@@ -635,7 +645,7 @@ class PPO(Controller):
         m = torch.min(ratio * advantage, clipped * advantage)
         return -m
     
-    def get_control(self, cost: float, obs: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, obs: np.ndarray) -> np.ndarray:
         assert obs.shape == (self.state_dim,), 'PPO requires full observation'
         state = obs
         
@@ -689,7 +699,7 @@ class LambdaController(Controller):
         self.stats = self._controller.stats
         pass
     
-    def get_control(self, cost: float, state: jnp.ndarray) -> jnp.ndarray:
+    def get_control(self, cost: float, state: np.ndarray) -> np.ndarray:
         control = self._get_control(self, cost, state)
         return control
     

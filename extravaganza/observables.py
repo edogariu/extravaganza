@@ -1,9 +1,8 @@
 from typing import Callable
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 
-from extravaganza.utils import set_seed, jkey, timestep_embedding
+from extravaganza.utils import set_seed, timestep_embedding
 
 """
 This class defines an "observable", which is some real-valued vector observation that is made using the current trajectory 
@@ -25,16 +24,15 @@ class Trajectory:
     
     def pad(self, min_len: int, control_dim: int = None, state_dim: int = None):
         while len(self.f) < min_len: self.f.append(0.)
-        while len(self.x) < min_len: self.x.append(jnp.zeros(state_dim) if state_dim is not None else None)
-        while len(self.u) < min_len: self.u.append(jnp.zeros(control_dim) if control_dim is not None else None)
+        while len(self.x) < min_len: self.x.append(np.zeros(state_dim) if state_dim is not None else None)
+        while len(self.u) < min_len: self.u.append(np.zeros(control_dim) if control_dim is not None else None)
     
-    def add_state(self, cost: float, state: jnp.ndarray):
+    def add_state(self, cost: float, state: np.ndarray):
         if hasattr(cost, 'item'): cost = cost.item()
-        # if abs(cost) > 1e2: cost /= (abs(cost) / 1e2)
         self.f.append(cost)
         self.x.append(state)
     
-    def add_control(self, control: jnp.ndarray):
+    def add_control(self, control: np.ndarray):
         self.u.append(control)
         
     def __len__(self):
@@ -48,7 +46,7 @@ class Observable:
         self.obs_dim = obs_dim
         pass
     
-    obs_func: Callable[[Trajectory], jnp.ndarray]
+    obs_func: Callable[[Trajectory], np.ndarray]
     obs_dim: int
     
     def __call__(self, trajectory: Trajectory):
@@ -106,18 +104,18 @@ class TimeDelayedObservation(Observable):
             if use_costs: 
                 t = trajectory.f[-hh:]
                 for _t in t: assert isinstance(_t, float), _t.__class__
-                obs.append(jnp.array(t))
+                obs.append(np.array(t))
             if use_cost_diffs: 
                 for _t in trajectory.f[-hh:]: assert isinstance(_t, float), _t.__class__
-                t = jnp.stack(trajectory.f[-hh:], axis=0) - jnp.stack(trajectory.f[-hh - 1:-1], axis=0)
+                t = np.stack(trajectory.f[-hh:], axis=0) - np.stack(trajectory.f[-hh - 1:-1], axis=0)
                 obs.append(t)
             if use_time: 
                 t = (1 + len(trajectory.u)) // 3
-                emb = timestep_embedding(jnp.array([[t],]), embedding_dim=time_embedding_dim, method='sin')
+                emb = timestep_embedding(np.array([[t],]), embedding_dim=time_embedding_dim, method='sin')
                 assert emb.shape == (time_embedding_dim,)
                 obs.append(emb)
                 
-            obs = jnp.concatenate(obs, axis=-1)
+            obs = np.concatenate(obs, axis=-1)
             assert obs.shape == (obs_dim,), (obs.shape, obs_dim)
             return obs
         
@@ -139,7 +137,7 @@ class PartialObservation(Observable):
                  state_dim: int,
                  seed: int = None) -> None:
         set_seed(seed)
-        self.C = jax.random.normal(jkey(), shape=(obs_dim, state_dim))
+        self.C = np.random.randn(obs_dim, state_dim)
         
         def obs_func(trajectory: Trajectory):
             return self.C @ trajectory.x[-1]  # transfromation of last state
@@ -170,20 +168,20 @@ if __name__ == '__main__':
     trajs = []
     traj = Trajectory()
     state = system.initial_state
-    cost = system.cost_fn(state, jnp.zeros(du))
+    cost = system.cost_fn(state, np.zeros(du))
     traj.add_state(cost, state)
     for _ in range(100):  # make a trajectory of len 100
-        control = sample(jkey(), (du,))
+        control = sample((du,))
         cost, state = system.interact(control)
         traj.add_state(cost, state)
         traj.add_control(control)
         trajs.append(deepcopy(traj))
     
     # make sure observations were ok the whole way through
-    if use_costs: assert jnp.allclose(td.norm_fn(td(traj)), cost ** 2)    
+    if use_costs: assert np.allclose(td.norm_fn(td(traj)), cost ** 2)    
     def check(traj):
-        assert full(traj).shape == (full.obs_dim,) and jnp.allclose(full(traj), traj.x[-1]), full(traj).shape
-        assert partial(traj).shape == (partial.obs_dim,) and jnp.allclose(partial(traj), partial.C @ traj.x[-1]), partial(traj).shape
+        assert full(traj).shape == (full.obs_dim,) and np.allclose(full(traj), traj.x[-1]), full(traj).shape
+        assert partial(traj).shape == (partial.obs_dim,) and np.allclose(partial(traj), partial.C @ traj.x[-1]), partial(traj).shape
         assert td(traj).shape == (td.obs_dim,)
         assert custom(traj).shape == (custom.obs_dim,) and custom(traj) == traj.x[-1].mean()
     for traj in trajs: check(traj)

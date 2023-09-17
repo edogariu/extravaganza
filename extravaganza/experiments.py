@@ -17,11 +17,10 @@ from multiprocessing import Manager, Value
 from pathos.multiprocessing import ProcessPool as Pool
 
 import numpy as np
-import jax.numpy as jnp
 
 from extravaganza.controllers import Controller
 from extravaganza.dynamical_systems import DynamicalSystem
-from extravaganza.observables import Trajectory, Observable, TimeDelayedObservation
+from extravaganza.observables import Trajectory, Observable
 from extravaganza.stats import Stats
 from extravaganza.utils import set_seed, get_color
 
@@ -104,8 +103,8 @@ class Experiment:
             # handle stats
             stats = Stats()
             stats.register('costs', obj_class=float)
-            stats.register('controls', obj_class=jnp.ndarray, shape=(controller.control_dim,))
-            stats.register('observations', obj_class=jnp.ndarray, shape=(observable.obs_dim,))
+            stats.register('controls', obj_class=np.ndarray, shape=(controller.control_dim,))
+            stats.register('observations', obj_class=np.ndarray, shape=(observable.obs_dim,))
             stats.register('true states')  # we don't know apriori if the states will be arrays, None, strings, ???
             
             # for rendering
@@ -150,8 +149,8 @@ class Experiment:
             pbar = tqdm.trange(T) if append_list is None else range(T)
             traj = Trajectory()
             # if isinstance(observable, TimeDelayedObservation): traj.pad(observable.hh, controller.control_dim, observable.obs_dim)
-            cost, obs = 0., jnp.zeros(observable.obs_dim)
-            control = controller.initial_control if hasattr(controller, 'initial_control') else jnp.zeros(controller.control_dim)  
+            cost, obs = 0., np.zeros(observable.obs_dim)
+            control = controller.initial_control if hasattr(controller, 'initial_control') else np.zeros(controller.control_dim)  
             for t in pbar:
                 if t == 0 or reset_condition(t):
                     logging.info('(EXPERIMENT): reset at t={}!'.format(t))
@@ -174,17 +173,19 @@ class Experiment:
 
                 control = controller.get_control(cost, obs)
                 traj.add_control(control)
+                
+                for v in (control, state, obs): assert isinstance(v, np.ndarray)
                     
                 render(t, cost, state)
                 
                 if append_list is None: 
                     postfix = {}
-                    if isinstance(state, jnp.ndarray) and state.shape == (1,): postfix['state'] = state.item()
+                    if isinstance(state, np.ndarray) and state.shape == (1,): postfix['state'] = state.item()
                     postfix['control'] = control.item() if control.shape == (1,) else control
                     postfix['cost'] = cost
                     pbar.set_postfix(postfix)
                 
-                if (isinstance(state, jnp.ndarray) and jnp.any(jnp.isnan(state))) or (cost > 1e20):
+                if (isinstance(state, np.ndarray) and np.any(np.isnan(state))) or (cost > 1e20):
                     logging.error('(EXPERIMENT): state {} or cost {} diverged at step {}'.format(state, cost, t))
                     if append_list is not None: 
                         with counter.get_lock():

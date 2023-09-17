@@ -6,7 +6,7 @@ from scipy.linalg import solve_discrete_are, orth
 import math
 
 import numpy as np
-import jax
+# import jax
 import jax.numpy as jnp
 import torch
 import torch.nn as nn
@@ -36,7 +36,7 @@ COLORS = {
           'Linear': 'brown',
           'Lifted': 'm'}
 
-SAMPLING_METHOD = 'normal'  # must be in `['ball', 'sphere', 'rademacher', 'normal']``
+SAMPLING_METHOD = 'normal'  # must be in `['sphere', 'normal']``
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def render(experiment, xkey, ykey, sliderkey: str = None, save_path: str = None, duration: float = 5, fps: int = 30):
@@ -73,6 +73,13 @@ def render(experiment, xkey, ykey, sliderkey: str = None, save_path: str = None,
         logging.info('(RENDERER): saved rendering to `{}`'.format(save_path))
     plt.close(fig)
     return anim
+
+def xlim(ax, left, right):
+    _l, _r = ax.get_xlim()
+    l = max(_l, left)
+    r = min(_r, right)
+    ax.set_xlim(l, r)
+    return ax
 
 def ylim(ax, left, right):
     _l, _r = ax.get_ylim()
@@ -112,13 +119,13 @@ def get_classname(obj):
 def summarize_lds(A, B):
     s = ''
     s += '||A||_op = {}'.format(opnorm(A))
-    s += '\n||B||_F = {}'.format(jnp.linalg.norm(B, ord='fro'))
+    s += '\n||B||_F = {}'.format(np.linalg.norm(B, ord='fro'))
     try:
         s += '\n||A-BK||_op = {}'.format(opnorm(A - B @ dare_gain(A, B)))
     except:
         s += '\n||A-BK||_op folded (couldnt find finite solution)'
-    s += '\neig(A) = {}'.format(np.sort([jnp.linalg.norm(e) for e in jnp.linalg.eigvals(A)])[::-1])
-    s += '\nsvd(B) = {}'.format(jnp.linalg.svd(B)[1])
+    s += '\neig(A) = {}'.format(np.sort([np.linalg.norm(e) for e in np.linalg.eigvals(A)])[::-1])
+    s += '\nsvd(B) = {}'.format(np.linalg.svd(B)[1])
     return s
 
 def opnorm(X):
@@ -149,9 +156,9 @@ def dare_gain(A, B, Q = None, R = None):
         K = jnp.linalg.inv(B.T @ P @ B + R) @ (B.T @ P @ A)  # compute LQR gain
     return K
 
-def method_of_moments(xs: jnp.ndarray, 
-                      us: jnp.ndarray,
-                      mask: jnp.ndarray = None):
+def method_of_moments(xs: np.ndarray, 
+                      us: np.ndarray,
+                      mask: np.ndarray = None):
     """
     runs method of moments to find A, B s.t.
         `A @ x_{t} + B @ u_{t} = x_{t+1}`
@@ -171,23 +178,20 @@ def method_of_moments(xs: jnp.ndarray,
         A = torch.tensordot(C_1, C_0, dims=((0, 2), (0, 2))) @ C_inv
         return A, B
         
-    elif isinstance(xs, np.ndarray):
-        xs, us = jnp.array(xs), jnp.array(us)
-        
     # prepare vectors and retrieve B
-    N_j = jnp.array([jnp.dot(xs[j + 1: j + scan_len + 1].T, us[:scan_len]) for j in range(k + 1)]) / scan_len
+    N_j = np.array([np.dot(xs[j + 1: j + scan_len + 1].T, us[:scan_len]) for j in range(k + 1)]) / scan_len
     B = N_j[0] # jnp.dot(states[1:].T, eps[:-1]) / (self.t - 1)
 
     # retrieve A
     C_0, C_1 = N_j[:-1], N_j[1:]
-    C_inv = jnp.linalg.inv(jnp.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-6 * jnp.identity(xs.shape[1]))
-    A = jnp.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
+    C_inv = np.linalg.inv(np.tensordot(C_0, C_0, axes=((0, 2), (0, 2))) + 1e-6 * np.identity(xs.shape[1]))
+    A = np.tensordot(C_1, C_0, axes=((0, 2), (0, 2))) @ C_inv
     
     return A, B
     
-def least_squares(xs: jnp.ndarray, 
-                  us: jnp.ndarray, 
-                  mask: jnp.ndarray = None,
+def least_squares(xs: np.ndarray, 
+                  us: np.ndarray, 
+                  mask: np.ndarray = None,
                   max_opnorm: float = None):
     """
     runs least squares to find A, B s.t.
@@ -235,32 +239,32 @@ def least_squares(xs: jnp.ndarray,
         A_B = omin['x'].reshape(A_B_shape)
         A, B = A_B[:, :ds], A_B[:, ds:]
         
-    return jnp.array(A), jnp.array(B)
+    return A, B
 
 
-# --------------------------------------------------------------------------------
-# teeny bit of hacking to make the jax PRNG key have a global state
-# this is NOT in accordance with jax's philosophy on PRNGs, but
-class _JKey:
-    def __init__(self):
-        self.jkey = None
-        self.needs_reset = True
-        pass
+# # --------------------------------------------------------------------------------
+# # teeny bit of hacking to make the jax PRNG key have a global state
+# # this is NOT in accordance with jax's philosophy on PRNGs, but
+# class _JKey:
+#     def __init__(self):
+#         self.jkey = None
+#         self.needs_reset = True
+#         pass
     
-    def reset(self, seed: int):
-        # if self.needs_reset:
-        self.jkey = jax.random.PRNGKey(seed)
-        # print('reset with seed {}'.format(seed))
-        self.needs_reset = False
-        pass
+#     def reset(self, seed: int):
+#         # if self.needs_reset:
+#         self.jkey = jax.random.PRNGKey(seed)
+#         # print('reset with seed {}'.format(seed))
+#         self.needs_reset = False
+#         pass
         
-    def __call__(self):
-        assert self.jkey is not None, 'must call `set_seed()` before using PRNG'
-        self.jkey, key = jax.random.split(self.jkey)
-        self.needs_reset = True
-        return key
+#     def __call__(self):
+#         assert self.jkey is not None, 'must call `set_seed()` before using PRNG'
+#         self.jkey, key = jax.random.split(self.jkey)
+#         self.needs_reset = True
+#         return key
     
-jkey = _JKey()
+# jkey = _JKey()
 random_numbers = list(np.random.randint(10000, size=(10000,)))
 
 def set_seed(seed: int = None, meta_seed: int = None):
@@ -276,26 +280,35 @@ def set_seed(seed: int = None, meta_seed: int = None):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    jkey.reset(seed)
     pass
-# --------------------------------------------------------------------------------
+# # --------------------------------------------------------------------------------
     
-def sample(jkey: jax.random.KeyArray, 
-           shape,
-           sampling_method=SAMPLING_METHOD) -> jnp.ndarray:
-    assert sampling_method in ['ball', 'sphere', 'rademacher', 'normal']
+# def sample(jkey: jax.random.KeyArray, 
+#            shape,
+#            sampling_method=SAMPLING_METHOD) -> jnp.ndarray:
+#     assert sampling_method in ['ball', 'sphere', 'rademacher', 'normal']
+#     assert len(shape) > 0
+#     if sampling_method == 'ball':
+#         if len(shape) == 1: v = jax.random.ball(jkey, d=shape[0], dtype=jnp.float32).reshape(*shape)
+#         else: v = jax.random.ball(jkey, np.prod(shape[1:]), shape=shape[:1], dtype=jnp.float32).reshape(*shape)  # if dim >= 2, assumes batch and flatten rest
+#     elif sampling_method == 'sphere':
+#         assert len(shape) <= 2, 'expected either 1D vector or 2D with a batch dim'
+#         v = jax.random.normal(jkey, shape, dtype=jnp.float32)
+#         v = v / jnp.linalg.norm(v, axis=-1).reshape(*shape[:-1], 1)
+#     elif sampling_method == 'rademacher':
+#         v = jax.random.rademacher(jkey, shape, dtype=jnp.float32)
+#     elif sampling_method == 'normal':
+#         v = jax.random.normal(jkey, shape, dtype=jnp.float32)
+#     assert v.shape == shape, 'needed {} and got {}'.format(shape, v.shape)
+#     return v
+
+def sample(shape, sampling_method=SAMPLING_METHOD) -> np.ndarray:
+    assert sampling_method in ['sphere', 'normal']
     assert len(shape) > 0
-    if sampling_method == 'ball':
-        if len(shape) == 1: v = jax.random.ball(jkey, d=shape[0], dtype=jnp.float32).reshape(*shape)
-        else: v = jax.random.ball(jkey, np.prod(shape[1:]), shape=shape[:1], dtype=jnp.float32).reshape(*shape)  # if dim >= 2, assumes batch and flatten rest
-    elif sampling_method == 'sphere':
+    v = np.random.randn(*shape)
+    if sampling_method == 'sphere':
         assert len(shape) <= 2, 'expected either 1D vector or 2D with a batch dim'
-        v = jax.random.normal(jkey, shape, dtype=jnp.float32)
-        v = v / jnp.linalg.norm(v, axis=-1).reshape(*shape[:-1], 1)
-    elif sampling_method == 'rademacher':
-        v = jax.random.rademacher(jkey, shape, dtype=jnp.float32)
-    elif sampling_method == 'normal':
-        v = jax.random.normal(jkey, shape, dtype=jnp.float32)
+        v = v / np.linalg.norm(v, axis=-1).reshape(*shape[:-1], 1)
     assert v.shape == shape, 'needed {} and got {}'.format(shape, v.shape)
     return v
     
@@ -303,31 +316,31 @@ def _arctanh(t):
     """
     returns inverse of tanh
     """ 
-    assert jnp.all(jnp.abs(t) <= 1), 'must be in `[-1, 1]^n` to take inverse hyperbolic tan'   
-    return 0.5 * jnp.log((1 + t) / (1 - t + 1e-8))
+    assert np.all(np.abs(t) <= 1), 'must be in `[-1, 1]^n` to take inverse hyperbolic tan'   
+    return 0.5 * np.log((1 + t) / (1 - t + 1e-8))
 
-def rescale(t, bounds, use_tanh) -> jnp.ndarray:
+def rescale(t, bounds, use_tanh) -> np.ndarray:
     """
     rescales from `[-1, 1] -> [tmin, tmax]`
     
         `s = (0.5 + clip(t, -1, 1) / 2) * (tmax - tmin) + tmin
     """
     tmin, tmax = bounds
-    t = jnp.tanh(t) if use_tanh else jnp.clip(t, -1, 1)
+    t = np.tanh(t) if use_tanh else np.clip(t, -1, 1)
     t = (1 + t) / 2
     t = (tmax - tmin) * t + tmin
     return t
 
-def d_rescale(t, bounds, use_tanh) -> jnp.ndarray:
+def d_rescale(t, bounds, use_tanh) -> np.ndarray:
     tmin, tmax = bounds
     d = (tmax - tmin) / 2
-    if use_tanh: d *= 1 - jnp.tanh(t) ** 2
+    if use_tanh: d *= 1 - np.tanh(t) ** 2
     return d
 
-def inv_rescale(s, bounds, use_tanh) -> jnp.ndarray:
+def inv_rescale(s, bounds, use_tanh) -> np.ndarray:
     tmin, tmax = bounds
     t = (s - tmin) / (tmax - tmin)
-    t = jnp.clip(2 * t - 1, -1, 1)
+    t = np.clip(2 * t - 1, -1, 1)
     if use_tanh: 
         t = _arctanh(t)
     return t
@@ -348,24 +361,22 @@ def timestep_embedding(timesteps, embedding_dim, method='sin', max_period=10000)
     max_period : int, optional
         maximum period for sinusoidal embeddings, by default 10000
     """
-    if not isinstance(timesteps, jnp.ndarray):
-        timesteps = jnp.array(timesteps)
     if timesteps.ndim == 1: timesteps = timesteps[None]
     if method == 'sin':
         half = embedding_dim // 2
         emb = math.log(max_period) / half
-        emb = jnp.exp(jnp.arange(half, dtype=float) * -emb)
+        emb = np.exp(np.arange(half, dtype=float) * -emb)
         emb = timesteps[:, None].astype(float) * emb[None]
-        emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=1)
+        emb = np.concatenate([np.cos(emb), np.sin(emb)], axis=1)
 
-        if embedding_dim % 2 == 1:  # Zero pad for odd dimensions, ty to https://stackoverflow.com/questions/69453600/inverse-operation-to-padding-in-jax for conversion to jax
-            pad = (0, 1, 0, 0)
-            value = 0.
-            pad = list(zip(*[iter(pad)]*2))
-            pad += [(0, 0)] * (emb.ndim - len(pad))
-            emb = jax.lax.pad(emb, padding_config=[(i, j, 0) for i, j in pad[::-1]], padding_value=jnp.array(value, emb.dtype))
+        # if embedding_dim % 2 == 1:  # Zero pad for odd dimensions, ty to https://stackoverflow.com/questions/69453600/inverse-operation-to-padding-in-jax for conversion to jax
+        #     pad = (0, 1, 0, 0)
+        #     value = 0.
+        #     pad = list(zip(*[iter(pad)]*2))
+        #     pad += [(0, 0)] * (emb.ndim - len(pad))
+        #     emb = jax.lax.pad(emb, padding_config=[(i, j, 0) for i, j in pad[::-1]], padding_value=jnp.array(value, emb.dtype))
     elif method == 'identity':
-        emb = jnp.expand_dims(timesteps, axis=-1).expand([*timesteps.shape, embedding_dim])
+        emb = np.expand_dims(timesteps, axis=-1).expand([*timesteps.shape, embedding_dim])
         logging.warning('(UTILS): using identity timestep embeddings. not too sure if this is a good idea')
     return emb.reshape(embedding_dim)
 
@@ -383,6 +394,9 @@ def append(arr, val):
             val = jnp.array(val, dtype=arr.dtype)
         arr = arr.at[0].set(val)
         arr = jnp.roll(arr, -1, axis=0)
+    elif isinstance(arr, np.ndarray):
+        arr[0] = val
+        arr = np.roll(arr, -1, axis=0)
     return arr
 
 def window_average(seq, window_size: int, use_median: bool=False):
@@ -599,8 +613,8 @@ class ContinuousCartPoleEnv(gym.Env):
         return (x, x_dot, theta, theta_dot)
 
     def step(self, action):
-        assert self.action_space.contains(action), \
-            "%r (%s) invalid" % (action, type(action))
+        # assert self.action_space.contains(action), \
+        #     "%r (%s) invalid" % (action, type(action))
         # Cast action to float to strip np trappings
         force = self.force_mag * float(action)
         self.state = self.stepPhysics(force)
@@ -685,7 +699,14 @@ Any further steps are undefined behavior.
         if self.viewer:
             self.viewer.close()
 
-def random_lds(
+def random_lds(state_dim: int, control_dim: int):
+    done = False
+    while not done:
+        A, B = _random_lds(state_dim, control_dim)
+        done = all(np.linalg.eigvals(A) > 0.2) and all(np.linalg.svd(B)[1] > 0.2)
+    return (A.reshape(state_dim, state_dim), B.reshape(state_dim, control_dim))
+
+def _random_lds(
     state_dim: int, 
     control_dim: int,
     obs_dim: int = None, 

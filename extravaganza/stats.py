@@ -94,14 +94,15 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
             logging.error('(STATS) failed to concatenate only 1 stat')
             return stats[0]
         
-        _stats = []
-        for i in range(len(stats) - 1): 
-            if stats[i] not in stats[i+1:]:
-                _stats.append(stats[i])
-        _stats.append(stats[-1])
+        # _stats = []
+        # for i in range(len(stats) - 1): 
+        #     if stats[i] not in stats[i+1:]:
+        #         _stats.append(stats[i])
+        # _stats.append(stats[-1])
         
         concatenated_stats = Stats()
         for s in stats:
+            if s is None: continue
             assert not s.aggregated, 'cannot concatenate aggregated stats'
             if not set(concatenated_stats._stats.keys()).isdisjoint(set(s._stats.keys())): 
                 print(set(concatenated_stats._stats.keys()).intersection(set(s._stats.keys())))
@@ -134,14 +135,14 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
                 l = min([len(v) for v in agg_stat.values])
                 if l == 0: continue
                 for i in range(len(agg_stat.values)): agg_stat.values[i] = agg_stat.values[i][:l]
-                vs = jnp.array(agg_stat.values)
+                vs = np.array(agg_stat.values)
                 means, stds = vs.mean(axis=0).squeeze(), vs.std(axis=0).squeeze()
                 val = {'means': means, 'stds': stds, 'vs': vs}
                 aggregate_stats._stats[k] = aggregate_stats._stats[k]._replace(values=val)
                 
                 if agg_stat.plottable:
                     for i in range(len(agg_stat.ts)): agg_stat.ts[i] = agg_stat.ts[i][:l]
-                    ts = jnp.array(agg_stat.ts).reshape(N, -1)
+                    ts = np.array(agg_stat.ts).reshape(N, -1)
                     assert ts.std(axis=0).mean() < 1e-4, (ts, k)
                     aggregate_stats._stats[k] = aggregate_stats._stats[k]._replace(ts=ts[0])  # just use the first set of times, they should all be the same
             except Exception as e:
@@ -154,7 +155,7 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
     
     def plot(self, ax, key, 
              plot_idx: int = None, plot_norm: bool = False, plot_cummean: bool = False,
-             fmt: str = '', label: str = None, color: str = None):            
+             fmt: str = '', label: str = None, color: str = None, linewidth: float = 1.):            
         # make sure things make sense
         assert not (plot_idx is not None and plot_norm), 'cant plot both index {} and the norm!'.format(plot_idx)
         # assert key in self._stats, '{} not in {}'.format(key, self._stats.keys())
@@ -164,6 +165,7 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
         assert stat.plottable
 
         if self.aggregated:
+            if len(stat.values['vs']) == 0: return ax
             STD_CONFIDENCE = 1.
             ts = stat.ts
             means, stds, vs = stat.values['means'], stat.values['stds'], stat.values['vs']
@@ -174,21 +176,22 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
                 means, stds = means[:, plot_idx], stds[:, plot_idx]
             elif plot_norm:  # we have to do it this way since norm of avg vector is not the avg of the vector norms
                 assert vs.ndim == 3, 'we dont have multidimensional stats to plot the norm of in the first place'  # (N, T, D)
-                norms = jnp.linalg.norm(vs, axis=-1)
+                norms = np.linalg.norm(vs, axis=-1)
                 means, stds = norms.mean(axis=0).squeeze(), norms.std(axis=0).squeeze()
                 
             if plot_cummean:  # compute moments of the cumulative mean of the RV
-                means = jnp.cumsum(means, axis=0) / jnp.arange(1, means.shape[0] + 1)
-                stds = jnp.sqrt(jnp.cumsum(stds ** 2, axis=0)) / jnp.arange(1, stds.shape[0] + 1)
+                means = np.cumsum(means, axis=0) / np.arange(1, means.shape[0] + 1)
+                stds = np.sqrt(np.cumsum(stds ** 2, axis=0)) / np.arange(1, stds.shape[0] + 1)
             
             ax.plot(ts, means, fmt, label=label, color=color)
             ax.fill_between(ts, means - STD_CONFIDENCE * stds, means + STD_CONFIDENCE * stds, alpha=0.4, facecolor=color)
         else:
+            if len(stat.values) == 0: return ax
             ts, vals = stat.ts, np.array(stat.values)
             if plot_idx is not None: vals = vals[:, plot_idx]
-            elif plot_norm: vals = np.linalg.norm(vals, dim=-1)
+            elif plot_norm: vals = np.linalg.norm(vals, axis=-1)
             if plot_cummean: vals = np.cumsum(vals) / np.arange(1, len(vals) + 1)
-            ax.plot(stat.ts, vals, fmt, label=label, color=color)
+            ax.plot(stat.ts, vals, fmt, label=label, color=color, linewidth=linewidth)
         
         ax.set_xlabel('timestep (t)')
         return ax
@@ -275,10 +278,10 @@ class Stats(MutableMapping):  # maps keys to the corresponding stats!
                 if len(stat.ts) != len(stat.values):
                     logging.warning('(STATS) weird stuff going on with {}'.format(k))
                     continue
-                t = jnp.array(stat.ts)
-                assert jnp.allclose(t, jnp.sort(t))  # make sure its sorted
-                ilo = jnp.argmax(t >= lo) if t[-1] >= lo else None
-                ihi = jnp.argmax(t >= hi) if t[0] <= hi else None
+                t = np.array(stat.ts)
+                assert np.allclose(t, np.sort(t))  # make sure its sorted
+                ilo = np.argmax(t >= lo) if t[-1] >= lo else None
+                ihi = np.argmax(t >= hi) if t[0] <= hi else None
                 if ilo is None or ihi is None: 
                     ts = []
                     vs = []

@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import numpy as np
 
-from extravaganza.utils import set_seed, jkey, least_squares, method_of_moments, opnorm
+from extravaganza.utils import set_seed, least_squares, method_of_moments, opnorm
 
 #  ============================================================================================
 #  ============================================================================================
@@ -53,16 +53,16 @@ class JaxMLP(jnn.Module):
         x = self.model(x)
         return x
     
-def get_jax_mlp(layer_dims: List[int],
-                activation: jnn.Module = jnn.activation.relu,
-                normalization: jnn.Module = None,  # normalize before the activation
-                drop_last_activation: bool = True,
-                use_bias: bool = True,
-                seed: int = None):
+# def get_jax_mlp(layer_dims: List[int],
+#                 activation: jnn.Module = jnn.activation.relu,
+#                 normalization: jnn.Module = None,  # normalize before the activation
+#                 drop_last_activation: bool = True,
+#                 use_bias: bool = True,
+#                 seed: int = None):
     
-    model = JaxMLP(layer_dims=layer_dims, activation=activation, normalization=normalization, drop_last_activation=drop_last_activation, use_bias=use_bias, seed=seed)
-    params = model.init(jkey(), jnp.zeros((1, layer_dims[0])))
-    return model, params
+#     model = JaxMLP(layer_dims=layer_dims, activation=activation, normalization=normalization, drop_last_activation=drop_last_activation, use_bias=use_bias, seed=seed)
+#     params = model.init(jkey(), jnp.zeros((1, layer_dims[0])))
+#     return model, params
 
 
 
@@ -293,6 +293,7 @@ class TorchLifter(nn.Module):
         # encode into latent space
         if unbatch: x = x.unsqueeze(0)
         assert x.shape[1] == self.obs_dim, (x.shape, self.obs_dim)
+        x = x.float()
         latent = self.get_latent(x)
         assert latent.shape[1] == self.latent_dim, (latent.shape, self.latent_dim)
         
@@ -301,6 +302,7 @@ class TorchLifter(nn.Module):
             assert sq_norms is not None
             if not isinstance(sq_norms, torch.Tensor): sq_norms = torch.tensor(sq_norms)
             if not unbatch: assert sq_norms.shape == (x.shape[0],) and all(sq_norms >= 0.)
+            sq_norms = sq_norms.float()
             
             # the classic 'divide by the norm' method, tried and true
             latent = latent / torch.norm(latent, dim=-1).unsqueeze(-1)
@@ -371,8 +373,8 @@ class TorchLifter(nn.Module):
             losses['cpc'] = self.cpc_loss(latent_hat[mask], gt)
             # losses['cpc'] = self.cpc_loss(latent_hat[mask], gt, latent_prev[mask])
             
-        if self.isometric: 
-            assert torch.allclose(torch.norm(latent, dim=-1) ** 2, sq_norms), (torch.norm(latent, dim=-1) ** 2, sq_norms)
+        if self.isometric: assert torch.allclose(torch.norm(latent, dim=-1) ** 2, sq_norms), (torch.norm(latent, dim=-1) ** 2, sq_norms)
+        
         if self.loss_weights['vmf']:  # VMF regularization
             v = latent[sq_norms > 0.01]  # grab vectors with above average norm
             unit_vecs = v / (torch.norm(v, dim=-1).unsqueeze(-1) + 1e-6)
@@ -425,8 +427,8 @@ if __name__ == '__main__':
     assert _TorchCNN(_TorchCNN_test).shape[1] == 16
     print('yippee!')
     
-    from testing.utils import count_parameters
+    from extravaganza.utils import count_parameters
     TorchMLP = TorchMLP(layer_dims=[int(28 * 28), 100, 100, 100, 100, 10]).float()
     TorchCNN = TorchCNN(input_shape=(28, 28), output_dim=10)
     print(count_parameters(TorchMLP), count_parameters(TorchCNN))
-
+    
